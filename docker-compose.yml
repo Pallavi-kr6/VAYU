@@ -1,0 +1,87 @@
+# docker-compose.yml
+# ─────────────────────────────────────────────────────────
+# VAYU — Production Stack (Supabase for persistence)
+# Services: API | Streamlit | Scheduler
+#
+# Usage:
+#   docker-compose up -d          # start all
+#   docker-compose logs -f api    # tail API logs
+#   docker-compose down           # stop all
+# ─────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ── FastAPI Backend ───────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      SUPABASE_URL:         ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      SUPABASE_ANON_KEY:    ${SUPABASE_ANON_KEY}
+      GROQ_API_KEY:         ${GROQ_API_KEY}
+      OPENWEATHER_API_KEY:  ${OPENWEATHER_API_KEY}
+      TWILIO_ACCOUNT_SID:   ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN:    ${TWILIO_AUTH_TOKEN}
+      TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER}
+    volumes:
+      - .:/app
+      - model_data:/app/models/saved
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Streamlit Dashboard ───────────────────────────────────
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      streamlit run streamlit_app.py
+        --server.port 8501
+        --server.address 0.0.0.0
+        --theme.base dark
+        --theme.backgroundColor "#0A1628"
+        --theme.secondaryBackgroundColor "#0D2137"
+        --theme.textColor "#e2f4ff"
+        --theme.primaryColor "#0D9488"
+    environment:
+      SUPABASE_URL:         ${SUPABASE_URL}
+      SUPABASE_ANON_KEY:    ${SUPABASE_ANON_KEY}
+      GROQ_API_KEY:         ${GROQ_API_KEY}
+      OPENWEATHER_API_KEY:  ${OPENWEATHER_API_KEY}
+    volumes:
+      - .:/app
+      - model_data:/app/models/saved
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+  # ── Background Scheduler (refresh data every 15 min) ────
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/scheduler.py
+    environment:
+      SUPABASE_URL:         ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      GROQ_API_KEY:         ${GROQ_API_KEY}
+      OPENWEATHER_API_KEY:  ${OPENWEATHER_API_KEY}
+    volumes:
+      - .:/app
+      - model_data:/app/models/saved
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  model_data:

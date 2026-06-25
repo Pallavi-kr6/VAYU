@@ -1,0 +1,1 @@
+["pm25", "pm10", "no2", "so2", "co", "o3", "temp", "humidity", "wind_speed", "wind_u", "wind_v", "pblh", "hour_sin", "hour_cos", "month_sin", "month_cos", "dow_sin", "dow_cos", "is_weekend", "is_rush_hour", "is_diwali_season", "is_stubble_season", "is_monsoon", "pm25_roll3h", "pm25_roll6h", "pm25_roll24h", "pm25_lag1h", "pm25_lag3h", "pm25_lag24h", "pm10_roll6h", "no2_roll6h"]

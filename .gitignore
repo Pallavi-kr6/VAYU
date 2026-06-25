@@ -1,0 +1,33 @@
+venv311/
+venv/
+__pycache__/
+*.pyc
+data/raw/
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+venv311/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model files
+*.pth
+*.pt
+*.pkl
+*.joblib
+
+# Dataset files
+data/raw/
+*.csv
+
+# OS files
+.DS_Store
+Thumbs.db

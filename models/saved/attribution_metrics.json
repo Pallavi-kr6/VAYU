@@ -1,0 +1,22 @@
+{
+  "src_vehicle": {
+    "mae": 0.0325,
+    "r2": 0.6652
+  },
+  "src_construction": {
+    "mae": 0.0288,
+    "r2": 0.2966
+  },
+  "src_industrial": {
+    "mae": 0.0287,
+    "r2": 0.4665
+  },
+  "src_biomass": {
+    "mae": 0.0289,
+    "r2": 0.669
+  },
+  "src_secondary": {
+    "mae": 0.0292,
+    "r2": 0.1449
+  }
+}
