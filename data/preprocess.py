@@ -24,28 +24,7 @@ PROCESSED_DIR = Path("data/processed")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── AQI Calculator (CPCB standard) ──────────────────────
-def compute_aqi(pm25: float, pm10: float) -> tuple[float, str]:
-    breakpoints = {
-        "pm25": [(0,30,0,50,"Good"),(30,60,51,100,"Satisfactory"),
-                 (60,90,101,200,"Moderate"),(90,120,201,300,"Poor"),
-                 (120,250,301,400,"Very Poor"),(250,500,401,500,"Severe")],
-        "pm10": [(0,50,0,50,"Good"),(50,100,51,100,"Satisfactory"),
-                 (100,250,101,200,"Moderate"),(250,350,201,300,"Poor"),
-                 (350,430,301,400,"Very Poor"),(430,600,401,500,"Severe")],
-    }
-    def sub_index(val, bps):
-        for lo_c, hi_c, lo_i, hi_i, cat in bps:
-            if lo_c <= val <= hi_c:
-                aqi = (hi_i - lo_i) / (hi_c - lo_c) * (val - lo_c) + lo_i
-                return round(aqi), cat
-        return 500, "Severe"
-
-    aqi25, cat25 = sub_index(pm25, breakpoints["pm25"])
-    aqi10, cat10 = sub_index(pm10, breakpoints["pm10"])
-    aqi = max(aqi25, aqi10)
-    cat = cat25 if aqi25 >= aqi10 else cat10
-    return aqi, cat
+from data.aqi_utils import compute_cpcb_aqi as compute_aqi
 
 
 # ── Feature Engineering ──────────────────────────────────

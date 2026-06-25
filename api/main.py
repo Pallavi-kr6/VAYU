@@ -31,7 +31,7 @@ from config.settings import CITIES
 from agents.vayu_agents import (
     VAYUOrchestrator, BUS, CitizenHealthShieldAgent
 )
-from data.download_data import generate_live_synthetic, fetch_openweather_live
+from data.download_data import fetch_openweather_live
 
 # ─── App setup ────────────────────────────────────────────
 app = FastAPI(
@@ -70,20 +70,29 @@ async def startup():
 
 # ─── Helper: refresh pipeline for a city ─────────────────
 async def _refresh_city(city: str):
-    """Pulls latest data, engineers features, then runs full agent pipeline."""
+    """Pulls latest OpenWeather data, engineers features, runs agent pipeline."""
     global _last_run
-    from config.settings import OPENWEATHER_API_KEY, GROQ_API_KEY
+    from config.settings import OPENWEATHER_API_KEY
     from data.preprocess import engineer_features
 
-    raw_df = fetch_openweather_live(city, api_key=OPENWEATHER_API_KEY)
+    raw_df, live_meta = fetch_openweather_live(city, api_key=OPENWEATHER_API_KEY)
+    BUS.set(f"live_{city}", live_meta)
 
-    # Raw fetch only has ~8 columns. The attribution model needs 25
-    # engineered features — same transformation used at training time.
-    try:
-        df = engineer_features(raw_df)
-    except Exception as e:
-        logger.warning(f"Feature engineering failed for {city}: {e} — using raw df")
-        df = raw_df
+    hist_records = []
+    for _, row in raw_df.iterrows():
+        hist_records.append({
+            "datetime": row["datetime"].isoformat() if hasattr(row["datetime"], "isoformat") else str(row["datetime"]),
+            "pm25":     float(row["pm25"]),
+            "pm10":     float(row.get("pm10", row["pm25"] * 1.8)),
+        })
+    BUS.set(f"history_{city}", hist_records)
+
+    df = engineer_features(raw_df)
+    BUS.set(f"features_{city}", {
+        "columns": list(df.columns),
+        "row_count": len(df),
+        "sample_last": df.iloc[-1].to_dict() if len(df) else {},
+    })
 
     orchestrator.run_city(city, df)
     _last_run[city] = datetime.utcnow().isoformat()
@@ -199,6 +208,7 @@ async def get_enforcement(city: str):
         "city":    city,
         "actions": data,
         "count":   len(data),
+        "message": None if data else f"No enforcement assets registered for {city}.",
         "generated_at": _last_run.get(city, "unknown"),
     }
 
@@ -240,35 +250,32 @@ async def get_dashboard(city: str):
         await _refresh_city(city)
 
     attr = BUS.get(f"attribution_{city}") or {}
-    fc   = (BUS.get(f"forecast_{city}") or [])[:48]  # next 12h
-    enf  = (BUS.get(f"enforcement_{city}") or [])[:3]
+    fc   = (BUS.get(f"forecast_{city}") or [])[:48]
+    enf  = (BUS.get(f"enforcement_{city}") or [])[:5]
     adv  = BUS.get(f"citizen_advisory_{city}") or {}
+    live = BUS.get(f"live_{city}") or {}
 
-    # AQI trend (last 6 hours, simulated from current reading)
-    current_pm25 = attr.get("current_pm25", 80)
-    hist_trend = []
-    for i in range(24, 0, -1):
-        noise = np.random.normal(0, 8)
-        pm25  = max(5, current_pm25 + noise)
-        hist_trend.append({
-            "hours_ago": i * 0.5,
-            "pm25":      round(pm25, 1),
-        })
+    hist_trend = BUS.get(f"history_{city}") or []
 
     return {
         "city":           city,
         "city_info":      CITIES[city],
         "last_updated":   _last_run.get(city, datetime.utcnow().isoformat()),
+        "live_api":       live,
         "attribution":    attr,
         "forecast_12h":   fc,
         "enforcement":    enf,
         "advisory":       adv,
         "historical_trend": hist_trend,
         "summary": {
-            "current_aqi":      attr.get("current_aqi", 200),
-            "aqi_category":     _aqi_to_cat(attr.get("current_aqi", 200)),
-            "dominant_source":  attr.get("dominant_source", "Unknown"),
-            "confidence":       attr.get("overall_confidence", 0.75),
+            "current_pm25":     attr.get("current_pm25"),
+            "current_aqi":      attr.get("current_aqi"),
+            "aqi_category":     attr.get("aqi_category") or _aqi_to_cat(attr.get("current_aqi", 0)),
+            "aqi_source":       attr.get("aqi_source", "cpcb_india"),
+            "aqi_label":        attr.get("aqi_label", "Derived AQI (CPCB)"),
+            "openweather_aqi":  live.get("openweather_aqi"),
+            "dominant_source":  attr.get("dominant_source"),
+            "confidence":       attr.get("overall_confidence"),
             "pending_actions":  len(enf),
         },
     }
@@ -352,6 +359,50 @@ async def whatsapp_webhook(
         content = {"status": "ok"},
         headers = {"Content-Type": "application/json"}
     )
+
+
+@app.get("/api/debug/{city}")
+async def debug_city(city: str):
+    """
+    Diagnostics: data lineage from OpenWeather API + trained models.
+    """
+    city = city.lower()
+    if city not in CITIES:
+        raise HTTPException(404, f"City '{city}' not supported")
+
+    if BUS.get(f"attribution_{city}") is None:
+        await _refresh_city(city)
+
+    attr = BUS.get(f"attribution_{city}") or {}
+    fc   = BUS.get(f"forecast_{city}") or []
+    enf  = BUS.get(f"enforcement_{city}") or []
+    live = BUS.get(f"live_{city}") or {}
+    feat = BUS.get(f"features_{city}") or {}
+
+    return {
+        "city":              city,
+        "timestamp":         datetime.utcnow().isoformat(),
+        "live_api_data":     live,
+        "derived_features":  feat,
+        "attribution_output": attr,
+        "forecast_output":   fc[:24],
+        "enforcement_output": enf,
+        "confidence_scores": {
+            "attribution_overall": attr.get("overall_confidence"),
+            "attribution_method":  attr.get("confidence_method"),
+            "per_source_pct":      {s["label"]: s["pct"] for s in attr.get("sources", [])},
+        },
+        "models": {
+            "attribution": "AttributionInference (XGBoost)",
+            "forecast":    "ForecastInference (BiLSTM)",
+        },
+        "data_lineage": {
+            "pm25":     "OpenWeather Air Pollution API → engineer_features → models",
+            "aqi":      "compute_cpcb_aqi(pm25, pm10) — Derived AQI (CPCB)",
+            "forecast": "LSTM on scaled features → inverse scaler → CPCB AQI",
+            "enforcement": "city enforcement_assets + attribution scores",
+        },
+    }
 
 
 # ─── Health check ─────────────────────────────────────────

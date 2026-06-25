@@ -70,114 +70,110 @@ def download_kaggle_datasets():
 # ─────────────────────────────────────────────────────────
 OPENWEATHER_API_BASE = "https://api.openweathermap.org/data/2.5"
 
-def fetch_openweather_live(city: str, api_key: str = None) -> pd.DataFrame:
+def fetch_openweather_live(city: str, api_key: str = None) -> tuple[pd.DataFrame, dict]:
     """
     Fetch live air quality + weather from OpenWeather.
 
-    Calls two OpenWeather endpoints:
-      1. Air Pollution API  → PM2.5, PM10, NO2, SO2, CO, O3, AQI
-         https://api.openweathermap.org/data/2.5/air_pollution
-      2. Current Weather API → temp, humidity, wind_speed, wind_dir
-         https://api.openweathermap.org/data/2.5/weather
-
-    Free tier: 1,000 calls/day — enough for all 6 cities at 15-min refresh.
-    Sign up:   https://openweathermap.org/api  (free, instant key)
-
-    The returned DataFrame has IDENTICAL columns to what the rest of
-    the pipeline expects — no other file needs to change.
+    Returns (DataFrame, metadata dict). No synthetic fallback — API key required.
+    Historical window uses repeated current reading (OpenWeather free tier = 1 point);
+    time features still vary across the 96 timesteps.
     """
     if not api_key:
-        logger.warning("No OpenWeather API key — using synthetic data for demo")
-        return generate_live_synthetic(city)
+        raise RuntimeError(
+            "OPENWEATHER_API_KEY is required. Set it in .env — no synthetic fallback."
+        )
 
     from config.settings import CITIES
+    from data.aqi_utils import format_openweather_aqi, compute_cpcb_aqi
+
     coords = CITIES.get(city.lower())
     if not coords:
-        logger.warning(f"Unknown city '{city}' — using synthetic data")
-        return generate_live_synthetic(city)
+        raise ValueError(f"Unknown city '{city}'")
 
     lat, lon = coords["lat"], coords["lon"]
     OW_BASE  = "https://api.openweathermap.org/data/2.5"
 
-    try:
-        # ── 1. Air Pollution (pollutants + AQI) ──────────────
-        ap_resp = requests.get(
-            f"{OW_BASE}/air_pollution",
-            params={"lat": lat, "lon": lon, "appid": api_key},
-            timeout=10,
-        )
-        ap_resp.raise_for_status()
-        ap = ap_resp.json()["list"][0]           # most recent reading
+    ap_resp = requests.get(
+        f"{OW_BASE}/air_pollution",
+        params={"lat": lat, "lon": lon, "appid": api_key},
+        timeout=10,
+    )
+    ap_resp.raise_for_status()
+    ap = ap_resp.json()["list"][0]
 
-        components = ap["components"]
-        ow_aqi     = ap["main"]["aqi"]           # 1=Good … 5=Very Poor (OW scale)
+    components = ap["components"]
+    ow_aqi     = int(ap["main"]["aqi"])
 
-        # ── 2. Current Weather (meteorology) ─────────────────
-        wx_resp = requests.get(
-            f"{OW_BASE}/weather",
-            params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric"},
-            timeout=10,
-        )
-        wx_resp.raise_for_status()
-        wx = wx_resp.json()
+    wx_resp = requests.get(
+        f"{OW_BASE}/weather",
+        params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric"},
+        timeout=10,
+    )
+    wx_resp.raise_for_status()
+    wx = wx_resp.json()
 
-        # ── 3. Build historical window (last 96 × 15-min) ────
-        #    OpenWeather free tier returns only the current reading.
-        #    We pad back with slight noise so the LSTM gets a proper
-        #    48-step sequence — same approach as the synthetic fallback.
-        now    = pd.Timestamp.utcnow()
-        pm25   = float(components.get("pm2_5", 80))
-        pm10   = float(components.get("pm10",  pm25 * 1.8))
-        no2    = float(components.get("no2",   pm25 * 0.35))
-        so2    = float(components.get("so2",   pm25 * 0.12))
-        co     = float(components.get("co",    pm25 * 0.08))
-        o3     = float(components.get("o3",    40.0))
-        temp   = float(wx["main"]["temp"])
-        hum    = float(wx["main"]["humidity"])
-        ws     = float(wx["wind"].get("speed", 3.5))
-        wd     = float(wx["wind"].get("deg",   180.0))
-        pblh   = 800.0   # OpenWeather doesn't expose PBLH; use climatological default
+    now    = pd.Timestamp.utcnow()
+    pm25   = float(components.get("pm2_5", 0))
+    pm10   = float(components.get("pm10", pm25 * 1.8))
+    no2    = float(components.get("no2", 0))
+    so2    = float(components.get("so2", 0))
+    co     = float(components.get("co", 0))
+    o3     = float(components.get("o3", 0))
+    temp   = float(wx["main"]["temp"])
+    hum    = float(wx["main"]["humidity"])
+    ws     = float(wx["wind"].get("speed", 0))
+    wd     = float(wx["wind"].get("deg", 0))
+    pblh   = 800.0
 
-        rows = []
-        for i in range(96):
-            ts    = now - pd.Timedelta(minutes=15 * (95 - i))
-            noise = np.random.lognormal(0, 0.06)    # small realistic jitter
-            rows.append({
-                "station":   f"{city.title()} (OpenWeather)",
-                "lat":        lat,
-                "lon":        lon,
-                "datetime":   ts,
-                "pm25":       round(max(1.0, pm25  * noise), 1),
-                "pm10":       round(max(1.0, pm10  * noise), 1),
-                "no2":        round(max(0.0, no2   * noise), 1),
-                "so2":        round(max(0.0, so2   * noise), 1),
-                "co":         round(max(0.0, co    * noise), 2),
-                "o3":         round(max(0.0, o3    * noise), 1),
-                "temp":       round(temp + np.random.normal(0, 0.3), 1),
-                "humidity":   round(min(100, max(0, hum + np.random.normal(0, 1))), 1),
-                "wind_speed": round(max(0.1, ws   + np.random.normal(0, 0.2)), 1),
-                "wind_dir":   round((wd + np.random.normal(0, 5)) % 360, 0),
-                "pblh":       pblh + np.random.normal(0, 30),
-                "city":       city.title(),
-            })
+    cpcb_aqi, cpcb_cat = compute_cpcb_aqi(pm25, pm10)
 
-        df = pd.DataFrame(rows)
-        logger.success(
-            f"OpenWeather [{city}]: PM2.5={pm25} µg/m³  "
-            f"AQI={ow_aqi}  temp={temp}°C  ws={ws} m/s"
-        )
-        return df
+    rows = []
+    for i in range(96):
+        ts = now - pd.Timedelta(minutes=15 * (95 - i))
+        rows.append({
+            "station":    f"{city.title()} (OpenWeather)",
+            "lat":        lat,
+            "lon":        lon,
+            "datetime":   ts,
+            "pm25":       round(pm25, 2),
+            "pm10":       round(pm10, 2),
+            "no2":        round(no2, 2),
+            "so2":        round(so2, 2),
+            "co":         round(co, 2),
+            "o3":         round(o3, 2),
+            "temp":       round(temp, 1),
+            "humidity":   round(hum, 1),
+            "wind_speed": round(ws, 2),
+            "wind_dir":   round(wd, 0),
+            "pblh":       pblh,
+            "city":       city.title(),
+        })
 
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 401:
-            logger.error("OpenWeather: Invalid API key. Get one free at openweathermap.org/api")
-        else:
-            logger.error(f"OpenWeather HTTP error: {e}")
-        return generate_live_synthetic(city)
+    df = pd.DataFrame(rows)
+    meta = {
+        "source":              "openweather",
+        "city":                city.lower(),
+        "fetched_at":          now.isoformat(),
+        "pm25_ug_m3":          round(pm25, 2),
+        "pm10_ug_m3":          round(pm10, 2),
+        "temp_c":              round(temp, 1),
+        "humidity_pct":        round(hum, 1),
+        "wind_speed_ms":       round(ws, 2),
+        "openweather_aqi":     format_openweather_aqi(ow_aqi),
+        "cpcb_aqi":            {
+            "value":   cpcb_aqi,
+            "category": cpcb_cat,
+            "label":   f"Derived AQI (CPCB) {cpcb_aqi} ({cpcb_cat})",
+            "scale":   "cpcb_india",
+        },
+        "aqi_display_primary": "cpcb",
+    }
 
-    except Exception as e:
-        logger.error(f"OpenWeather error: {e} — falling back to synthetic")
-        return generate_live_synthetic(city)
+    logger.success(
+        f"OpenWeather [{city}]: PM2.5={pm25} µg/m³  "
+        f"CPCB AQI={cpcb_aqi}  OW AQI={ow_aqi}  temp={temp}°C"
+    )
+    return df, meta
 
 
 def fetch_openweather_history(city: str, api_key: str,

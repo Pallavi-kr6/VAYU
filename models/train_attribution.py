@@ -195,33 +195,27 @@ class AttributionInference:
     def predict(self, df: pd.DataFrame) -> dict:
         """
         df: recent readings DataFrame (feature-engineered)
-        Returns dict with:
-            sources: list of {source, label, pct, color}
-            overall_confidence: float 0-1
-            dominant_source: str
+        Returns dict with sources, overall_confidence, dominant_source
         """
         X = (
             df.reindex(columns=self.features, fill_value=0)
             .fillna(0)
             .values[-24:]
-        )  # last 24 readings, always aligned to training feature order
+        )
 
         if len(X) == 0:
-            return self._default_response()
+            raise ValueError("Attribution requires at least one feature-engineered row")
 
-        # Mean prediction over recent window
         preds_per_row = []
         for row in X:
             row_pred = np.array([m.predict(row.reshape(1, -1))[0] for m in self.models])
             preds_per_row.append(row_pred)
 
-        mean_pred = np.mean(preds_per_row, axis=0)
+        preds_arr = np.array(preds_per_row)
+        mean_pred = np.mean(preds_arr, axis=0)
         mean_pred = normalise_contributions(mean_pred.reshape(1, -1))[0]
 
-        # Confidence from variance across time window
-        std_pred  = np.std(preds_per_row, axis=0)
-        cv        = std_pred / (mean_pred + 1e-8)
-        confidence = float(np.clip(1 - cv.mean(), 0.55, 0.97))
+        confidence, conf_method = self._compute_confidence(preds_arr, mean_pred)
 
         sources = []
         for i, tgt in enumerate(self.targets):
@@ -239,20 +233,44 @@ class AttributionInference:
             "sources":            sources,
             "overall_confidence": round(confidence, 2),
             "dominant_source":    dominant,
+            "confidence_method":  conf_method,
         }
 
-    def _default_response(self) -> dict:
-        return {
-            "sources": [
-                {"source": "src_vehicle",      "label": "Vehicle Exhaust",     "pct": 38.0, "color": "#EF4444"},
-                {"source": "src_construction", "label": "Construction Dust",    "pct": 24.0, "color": "#F59E0B"},
-                {"source": "src_industrial",   "label": "Industrial Stacks",   "pct": 18.0, "color": "#065A82"},
-                {"source": "src_biomass",      "label": "Biomass Burning",     "pct": 12.0, "color": "#10B981"},
-                {"source": "src_secondary",    "label": "Secondary Aerosols",  "pct":  8.0, "color": "#0D9488"},
-            ],
-            "overall_confidence": 0.75,
-            "dominant_source": "Vehicle Exhaust",
-        }
+    @staticmethod
+    def _compute_confidence(preds_arr: np.ndarray, mean_pred: np.ndarray) -> tuple[float, str]:
+        """
+        Model-derived confidence (not hardcoded):
+        - Temporal stability across the 24-row input window
+        - Distribution peakedness (entropy of source mix)
+        - Cross-step agreement on each source proportion
+        """
+        n_sources = len(mean_pred)
+        std_per_source = np.std(preds_arr, axis=0)
+        mean_per_source = np.mean(preds_arr, axis=0)
+
+        # Temporal CV stability per source, then average
+        cv = std_per_source / (mean_per_source + 1e-8)
+        temporal_stability = float(np.clip(1.0 - np.mean(cv), 0.0, 1.0))
+
+        # Entropy of normalised mean prediction (peaked = high confidence)
+        p = mean_pred / (mean_pred.sum() + 1e-12)
+        entropy = -np.sum(p * np.log(p + 1e-12))
+        max_entropy = np.log(n_sources)
+        peakedness = float(1.0 - entropy / max_entropy)
+
+        # Row-to-row agreement (low spread relative to mean)
+        row_means = np.mean(preds_arr, axis=1)
+        row_spread = float(np.std(row_means) / (np.mean(row_means) + 1e-8))
+        agreement = float(np.clip(1.0 - row_spread, 0.0, 1.0))
+
+        if np.mean(std_per_source) < 1e-5:
+            confidence = 0.55 * peakedness + 0.45 * agreement
+            method = "entropy_agreement_flat_input"
+        else:
+            confidence = 0.45 * temporal_stability + 0.35 * peakedness + 0.20 * agreement
+            method = "entropy_temporal_cv"
+
+        return float(np.clip(confidence, 0.30, 0.99)), method
 
 
 if __name__ == "__main__":

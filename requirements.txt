@@ -17,10 +17,11 @@ pyproj==3.6.1
 # ── API / Backend ────────────────────────────────────────
 fastapi==0.111.0
 uvicorn==0.30.1
-httpx==0.25.0
+httpx==0.27.2
 pydantic==2.7.1
 python-dotenv==1.0.1
-supabase==2.4.0
+websockets>=13.0
+supabase==2.10.0
 
 # ── AI Agents / LLM ─────────────────────────────────────
 groq==0.9.0

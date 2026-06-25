@@ -20,22 +20,14 @@ from config.settings import (
     TWILIO_SID, TWILIO_TOKEN, TWILIO_WHATSAPP_NO
 )
 
-# ── Lazy-load ML models (only if trained files exist)
+# ── Lazy-load ML models (required — no mock fallback)
 def _load_attribution():
-    try:
-        from models.train_attribution import AttributionInference
-        return AttributionInference()
-    except Exception as e:
-        logger.warning(f"Attribution model not loaded: {e} — using mock")
-        return None
+    from models.train_attribution import AttributionInference
+    return AttributionInference()
 
 def _load_forecast():
-    try:
-        from models.train_forecast import ForecastInference
-        return ForecastInference()
-    except Exception as e:
-        logger.warning(f"Forecast model not loaded: {e} — using mock")
-        return None
+    from models.train_forecast import ForecastInference
+    return ForecastInference()
 
 # ── Groq client (single instance reused by all agents)
 groq_client = groq_lib.Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -111,17 +103,24 @@ class SourceAttributionAgent:
     def run(self, city: str, recent_df: pd.DataFrame) -> dict:
         logger.info(f"[AttributionAgent] Running for {city}...")
 
-        if self.model:
-            result = self.model.predict(recent_df)
-        else:
-            result = self._mock_attribution(city, recent_df)
+        result = self.model.predict(recent_df)
 
-        result["city"]        = city
-        result["timestamp"]   = datetime.utcnow().isoformat()
-        result["current_pm25"] = float(
-            recent_df["pm25"].iloc[-1] if "pm25" in recent_df else 85.0
+        from data.aqi_utils import compute_cpcb_aqi
+        current_pm25 = float(recent_df["pm25"].iloc[-1])
+        current_pm10 = float(
+            recent_df["pm10"].iloc[-1] if "pm10" in recent_df.columns
+            else current_pm25 * 1.8
         )
-        result["current_aqi"] = self._pm25_to_aqi(result["current_pm25"])
+        cpcb_aqi, cpcb_cat = compute_cpcb_aqi(current_pm25, current_pm10)
+
+        result["city"]              = city
+        result["timestamp"]         = datetime.utcnow().isoformat()
+        result["current_pm25"]      = current_pm25
+        result["current_pm10"]      = current_pm10
+        result["current_aqi"]       = cpcb_aqi
+        result["aqi_category"]      = cpcb_cat
+        result["aqi_source"]        = "cpcb_india"
+        result["aqi_label"]         = f"Derived AQI (CPCB) {cpcb_aqi} ({cpcb_cat})"
 
         BUS.set(f"attribution_{city}", result)
         from db.supabase_store import SupabaseStore
@@ -137,30 +136,11 @@ class SourceAttributionAgent:
                     f"Confidence: {result['overall_confidence']}")
         return result
 
-    def _mock_attribution(self, city: str, df: pd.DataFrame) -> dict:
-        month   = datetime.utcnow().month
-        biomass = 0.20 if month in [10, 11] else 0.10
-        vehicle = 0.38 - (biomass - 0.10) * 0.5
-        return {
-            "sources": [
-                {"source": "src_vehicle",      "label": "Vehicle Exhaust",    "pct": round(vehicle * 100, 1), "color": "#EF4444"},
-                {"source": "src_construction", "label": "Construction Dust",  "pct": 22.0,                    "color": "#F59E0B"},
-                {"source": "src_industrial",   "label": "Industrial Stacks",  "pct": 18.0,                    "color": "#065A82"},
-                {"source": "src_biomass",      "label": "Biomass Burning",    "pct": round(biomass * 100, 1), "color": "#10B981"},
-                {"source": "src_secondary",    "label": "Secondary Aerosols", "pct": 10.0,                    "color": "#0D9488"},
-            ],
-            "overall_confidence": 0.88,
-            "dominant_source":    "Vehicle Exhaust",
-        }
-
     @staticmethod
     def _pm25_to_aqi(pm25: float) -> int:
-        bps = [(0,30,0,50),(30,60,51,100),(60,90,101,200),
-               (90,120,201,300),(120,250,301,400),(250,500,401,500)]
-        for lo_c, hi_c, lo_i, hi_i in bps:
-            if lo_c <= pm25 <= hi_c:
-                return round((hi_i - lo_i) / (hi_c - lo_c) * (pm25 - lo_c) + lo_i)
-        return 500
+        from data.aqi_utils import compute_cpcb_aqi
+        aqi, _ = compute_cpcb_aqi(pm25, pm25 * 1.8)
+        return aqi
 
 
 # ════════════════════════════════════════════════════════
@@ -174,10 +154,7 @@ class PredictiveAQIAgent:
     def run(self, city: str, recent_df: pd.DataFrame, hours: int = 48) -> pd.DataFrame:
         logger.info(f"[ForecastAgent] Generating {hours}h forecast for {city}...")
 
-        if self.model:
-            forecast = self.model.predict(recent_df, n_steps=hours * 4)
-        else:
-            forecast = self._mock_forecast(city, recent_df, hours)
+        forecast = self.model.predict(recent_df, n_steps=hours * 4)
 
         BUS.set(f"forecast_{city}", forecast.to_dict(orient="records"))
         peak_idx = forecast["aqi_pred"].idxmax()
@@ -186,57 +163,25 @@ class PredictiveAQIAgent:
                     f"({peak_row['aqi_category']}) at +{peak_row['hours_ahead']:.1f}h")
         return forecast
 
-    def _mock_forecast(self, city: str, df: pd.DataFrame, hours: int = 48) -> pd.DataFrame:
-        base_pm25 = float(df["pm25"].mean()) if "pm25" in df else 90.0
-        records = []
-        for h in range(1, hours + 1):
-            for q in range(4):
-                t           = h - 1 + q * 0.25
-                hour_of_day = (datetime.utcnow().hour + t) % 24
-                factor      = 1 + 0.3 * (
-                    np.exp(-((hour_of_day - 8) ** 2) / 8) +
-                    np.exp(-((hour_of_day - 18) ** 2) / 8)
-                )
-                pm25 = max(5, base_pm25 * factor * np.random.lognormal(0, 0.1))
-                aqi  = SourceAttributionAgent._pm25_to_aqi(pm25)
-                records.append({
-                    "step_15min":   len(records) + 1,
-                    "hours_ahead":  round(t + 0.25, 2),
-                    "pm25_pred":    round(pm25, 1),
-                    "aqi_pred":     aqi,
-                    "aqi_category": self._aqi_to_cat(aqi),
-                })
-        return pd.DataFrame(records)
-
     @staticmethod
     def _aqi_to_cat(aqi: int) -> str:
-        if aqi <= 50:   return "Good"
-        if aqi <= 100:  return "Satisfactory"
-        if aqi <= 200:  return "Moderate"
-        if aqi <= 300:  return "Poor"
-        if aqi <= 400:  return "Very Poor"
-        return "Severe"
+        from data.aqi_utils import aqi_category
+        return aqi_category(aqi)
 
 
 # ════════════════════════════════════════════════════════
 # AGENT 3 — ENFORCEMENT INTELLIGENCE AGENT
 # ════════════════════════════════════════════════════════
 class EnforcementAgent:
-    POLLUTER_DB = [
-        {"id": "IND001", "name": "Bharat Steel Rolling Mill",      "type": "industrial",   "lat": 28.63, "lon": 77.21, "violations": 3, "last_check": "2025-11-10"},
-        {"id": "CON001", "name": "Apex Infrastructure Site A",     "type": "construction", "lat": 28.61, "lon": 77.19, "violations": 1, "last_check": "2025-12-01"},
-        {"id": "CON002", "name": "DDA Housing Project Sector 9",   "type": "construction", "lat": 28.65, "lon": 77.22, "violations": 2, "last_check": "2025-10-15"},
-        {"id": "VEH001", "name": "Old Diesel Bus Depot Anand Vihar","type": "vehicle",      "lat": 28.64, "lon": 77.32, "violations": 5, "last_check": "2025-09-20"},
-        {"id": "BIO001", "name": "Unauthorized Waste Burning Site", "type": "biomass",      "lat": 28.58, "lon": 77.25, "violations": 4, "last_check": "2025-11-28"},
-    ]
-
     def __init__(self):
         logger.info("EnforcementAgent initialized")
 
     def run(self, city: str) -> list[dict]:
+        from data.enforcement_assets import get_enforcement_assets
+
         attribution   = BUS.get(f"attribution_{city}") or {}
         forecast      = BUS.get(f"forecast_{city}") or []
-        peak_in_hours = 12
+        peak_in_hours = 12.0
 
         if forecast:
             fc_df         = pd.DataFrame(forecast)
@@ -247,16 +192,26 @@ class EnforcementAgent:
                    for s in attribution.get("sources", [])}
 
         from db.supabase_store import SupabaseStore
-        polluter_db = SupabaseStore.get_polluters(city) or self.POLLUTER_DB
+        polluter_db = SupabaseStore.get_polluters(city)
+        if not polluter_db:
+            polluter_db = get_enforcement_assets(city)
+
+        if not polluter_db:
+            logger.warning(f"[EnforcementAgent] No enforcement targets for {city}")
+            BUS.set(f"enforcement_{city}", [])
+            return []
+
+        attr_confidence = attribution.get("overall_confidence", 0.0)
 
         actions = []
         for p in polluter_db:
-            src_pct    = sources.get(p["type"], 5.0)
+            src_pct    = sources.get(p["type"], 0.0)
             recidivism = p["violations"] * 15
             urgency    = max(0, 100 - peak_in_hours * 4)
             score      = src_pct * 2 + recidivism + urgency
             actions.append({
                 **p,
+                "city":                 city,
                 "contrib":              round(src_pct, 1),
                 "score":                round(score, 1),
                 "src_contribution_pct": src_pct,
@@ -265,7 +220,7 @@ class EnforcementAgent:
                 "evidence": {
                     "satellite_flag": src_pct > 15,
                     "station_flag":   attribution.get("current_pm25", 0) > 100,
-                    "confidence":     attribution.get("overall_confidence", 0.75),
+                    "confidence":     attr_confidence,
                 },
             })
 
@@ -276,8 +231,9 @@ class EnforcementAgent:
             action["notice_draft"] = self._draft_notice(action, city)
 
         BUS.set(f"enforcement_{city}", top_actions)
-        logger.info(f"[EnforcementAgent] Top: {top_actions[0]['name']} "
-                    f"(score={top_actions[0]['priority_score']})")
+        if top_actions:
+            logger.info(f"[EnforcementAgent] Top ({city}): {top_actions[0]['name']} "
+                        f"(score={top_actions[0]['priority_score']})")
         return top_actions
 
     def _draft_notice(self, action: dict, city: str) -> str:
@@ -350,12 +306,16 @@ class CitizenHealthShieldAgent:
         ward        = profile.get("ward", f"{city.title()} Central")
         vulnerable  = profile.get("vulnerable", False)
 
-        next_24h_aqi = 200
+        next_24h_aqi = None
         if forecast:
             fc_df = pd.DataFrame(forecast)
             if "aqi_pred" in fc_df:
                 next_24h     = fc_df[fc_df["hours_ahead"] <= 24]
-                next_24h_aqi = int(next_24h["aqi_pred"].max()) if len(next_24h) else 200
+                if len(next_24h):
+                    next_24h_aqi = int(next_24h["aqi_pred"].max())
+
+        if next_24h_aqi is None:
+            next_24h_aqi = int(attribution.get("current_aqi", 0))
 
         severity = self._classify_severity(next_24h_aqi)
         dominant = attribution.get("dominant_source", "vehicle exhaust")
@@ -481,10 +441,11 @@ Include AQI numbers when relevant. Use emojis sparingly."""
 
     def _simple_chatbot(self, message: str, city: str) -> str:
         forecast = BUS.get(f"forecast_{city}") or []
-        aqi      = 200
+        attribution = BUS.get(f"attribution_{city}") or {}
+        aqi = int(attribution.get("current_aqi", 0))
         if forecast:
             fc_df = pd.DataFrame(forecast)
-            if "aqi_pred" in fc_df:
+            if "aqi_pred" in fc_df.columns and len(fc_df):
                 aqi = int(fc_df["aqi_pred"].iloc[0])
         return (
             f"🌬️ VAYU Air Quality Update — {city.title()}\n"
@@ -516,17 +477,17 @@ class MultiCityComparativeAgent:
             attr     = BUS.get(f"attribution_{city}") or {}
             fc       = BUS.get(f"forecast_{city}") or []
             enf      = BUS.get(f"enforcement_{city}") or []
-            peak_aqi = 200
+            peak_aqi = 0
             if fc:
                 fc_df    = pd.DataFrame(fc)
-                peak_aqi = int(fc_df["aqi_pred"].max()) if "aqi_pred" in fc_df else 200
+                peak_aqi = int(fc_df["aqi_pred"].max()) if "aqi_pred" in fc_df else 0
 
             report["cities"][city] = {
-                "current_pm25":      attr.get("current_pm25", 80),
-                "current_aqi":       attr.get("current_aqi", 180),
+                "current_pm25":      attr.get("current_pm25"),
+                "current_aqi":       attr.get("current_aqi"),
                 "peak_forecast_aqi": peak_aqi,
-                "dominant_source":   attr.get("dominant_source", "Unknown"),
-                "confidence":        attr.get("overall_confidence", 0.75),
+                "dominant_source":   attr.get("dominant_source"),
+                "confidence":        attr.get("overall_confidence"),
                 "pending_actions":   len(enf),
             }
 
@@ -544,11 +505,14 @@ class MultiCityComparativeAgent:
 
     def _generate_insights(self, report: dict, cities: list) -> list[str]:
         if not groq_client:
-            return [
-                "Delhi shows highest PM2.5 primarily from vehicle exhaust — consider odd-even policy.",
-                "Biomass burning season elevated 3 cities simultaneously — inter-state coordination needed.",
-                "Bengaluru's construction dust spike aligns with new metro line Phase 3 work.",
-            ]
+            insights = []
+            for city, d in report["cities"].items():
+                insights.append(
+                    f"{city.title()}: CPCB AQI {d.get('current_aqi')} — "
+                    f"dominant source {d.get('dominant_source')} "
+                    f"(confidence {int(d.get('confidence', 0) * 100)}%)."
+                )
+            return insights[:5]
         summary = json.dumps(report["cities"], indent=2)
         try:
             text = _groq_chat(
@@ -616,12 +580,16 @@ class VAYUOrchestrator:
         return results
 
 
-# ── Quick test
+# ── Quick test (requires OPENWEATHER_API_KEY in .env)
 if __name__ == "__main__":
-    from data.download_data import generate_live_synthetic
+    from config.settings import OPENWEATHER_API_KEY
+    from data.download_data import fetch_openweather_live
+    from data.preprocess import engineer_features
+
     orchestrator = VAYUOrchestrator()
-    test_df      = generate_live_synthetic("delhi")
-    result       = orchestrator.run_city("delhi", test_df)
+    raw_df, _ = fetch_openweather_live("delhi", api_key=OPENWEATHER_API_KEY)
+    feat_df = engineer_features(raw_df)
+    result = orchestrator.run_city("delhi", feat_df)
 
     print("\n── Attribution:")
     for s in result["attribution"]["sources"]:
