@@ -80,14 +80,17 @@ async def _refresh_city(city: str):
     )
     BUS.set(f"live_{city}", live_meta)
 
-    hist_records = []
-    for _, row in raw_df.iterrows():
-        hist_records.append({
-            "datetime": row["datetime"].isoformat() if hasattr(row["datetime"], "isoformat") else str(row["datetime"]),
-            "pm25":     float(row["pm25"]),
-            "pm10":     float(row.get("pm10", row["pm25"] * 1.8)),
-        })
-    BUS.set(f"history_{city}", hist_records)
+    now_iso = live_meta.get("fetched_at", datetime.utcnow().isoformat())
+    point = {
+        "datetime": now_iso,
+        "pm25":     float(live_meta.get("pm25_ug_m3", 0)),
+        "pm10":     float(live_meta.get("pm10_ug_m3", 0)),
+        "aqi":      int(live_meta.get("aqi", 0)),
+    }
+    prior = BUS.get(f"history_{city}") or []
+    if not prior or prior[-1].get("datetime") != point["datetime"]:
+        prior.append(point)
+    BUS.set(f"history_{city}", prior[-96:])
 
     df = engineer_features(raw_df)
     BUS.set(f"features_{city}", {
@@ -252,7 +255,8 @@ async def get_dashboard(city: str):
         await _refresh_city(city)
 
     attr = BUS.get(f"attribution_{city}") or {}
-    fc   = (BUS.get(f"forecast_{city}") or [])[:48]
+    fc_all = BUS.get(f"forecast_{city}") or []
+    fc   = fc_all[:48]
     enf  = (BUS.get(f"enforcement_{city}") or [])[:5]
     adv  = BUS.get(f"citizen_advisory_{city}") or {}
     live = BUS.get(f"live_{city}") or {}
@@ -266,6 +270,7 @@ async def get_dashboard(city: str):
         "live_api":       live,
         "attribution":    attr,
         "forecast_12h":   fc,
+        "forecast_48h":   fc_all[:192],
         "enforcement":    enf,
         "advisory":       adv,
         "historical_trend": hist_trend,

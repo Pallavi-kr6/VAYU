@@ -3,14 +3,50 @@
 # Supabase persistence for VAYU agent outputs & logs.
 # Falls back gracefully when SUPABASE_URL / key are unset.
 # ─────────────────────────────────────────────────────────
-
+from datetime import datetime, date
+import pandas as pd
+import numpy as np
 from datetime import datetime
 from typing import Any, Optional
 
 from loguru import logger
 
 _client = None
+def _json_safe(obj):
+    """Recursively convert pandas/numpy objects into JSON-serializable types."""
 
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+
+    # Pandas timestamps
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+
+    # Python datetime/date
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    # NumPy types
+    if isinstance(obj, np.integer):
+        return int(obj)
+
+    if isinstance(obj, np.floating):
+        return float(obj)
+
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    # NaN -> None
+    if pd.isna(obj):
+        return None
+
+    return obj
 
 def get_client():
     """Lazy singleton Supabase client (service role for backend writes)."""
@@ -40,19 +76,22 @@ class SupabaseStore:
 
     @staticmethod
     def set(key: str, value: Any) -> bool:
+        value = _json_safe(value)
         client = get_client()
         if not client:
             return False
         try:
-            client.table(SupabaseStore.CACHE_TABLE).upsert({
-                "key":        key,
-                "data":       value,
-                "updated_at": datetime.utcnow().isoformat(),
-            }).execute()
-            return True
+           client.table(SupabaseStore.CACHE_TABLE).upsert({
+            "key": key,
+            "data": value,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+
+           return True
+
         except Exception as e:
-            logger.warning(f"Supabase write failed ({key}): {e}")
-            return False
+          logger.warning(f"Supabase write failed ({key}): {e}")
+        return False
 
     @staticmethod
     def get(key: str) -> Optional[Any]:
@@ -76,25 +115,7 @@ class SupabaseStore:
     @staticmethod
     def load_all() -> dict[str, dict]:
         """Load entire agent cache into memory on startup."""
-        client = get_client()
-        if not client:
-            return {}
-        try:
-            resp = (
-                client.table(SupabaseStore.CACHE_TABLE)
-                .select("key,data,updated_at")
-                .execute()
-            )
-            return {
-                row["key"]: {
-                    "data":    row["data"],
-                    "updated": row["updated_at"],
-                }
-                for row in (resp.data or [])
-            }
-        except Exception as e:
-            logger.warning(f"Supabase load_all failed: {e}")
-            return {}
+        
 
     @staticmethod
     def get_polluters(city: Optional[str] = None) -> list[dict]:

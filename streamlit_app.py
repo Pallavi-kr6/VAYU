@@ -104,7 +104,7 @@ except Exception as e:
 summary = dash.get("summary", {})
 attr = dash.get("attribution", {})
 live = dash.get("live_api", {})
-fc_raw = dash.get("forecast_12h", [])
+fc_raw = dash.get("forecast_48h") or dash.get("forecast_12h", [])
 enf_data = dash.get("enforcement", [])
 hist = dash.get("historical_trend", [])
 
@@ -153,11 +153,40 @@ if tab == "📊 Overview":
         st.markdown(f'<div class="metric-card"><div class="metric-val">{int(confidence * 100)}%</div><div class="metric-lbl">Attribution confidence</div></div>', unsafe_allow_html=True)
 
     if not hist_df.empty:
-        st.markdown("### Recent readings (OpenWeather window)")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist_df["datetime"], y=hist_df["pm25"], name="PM2.5", line=dict(color="#0D9488")))
-        fig.update_layout(template="plotly_dark", height=300, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        pm25_std = hist_df["pm25"].std() if "pm25" in hist_df.columns else 0
+        n_pts = len(hist_df)
+
+        if n_pts >= 2 and pm25_std > 0.01:
+            st.markdown("### Recent readings (WAQI — built from live refreshes)")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=hist_df["datetime"], y=hist_df["pm25"],
+                name="PM2.5", mode="lines+markers", line=dict(color="#0D9488"),
+            ))
+            fig.update_layout(template="plotly_dark", height=300, margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.markdown("### 12-hour forecast (LSTM)")
+            st.caption(
+                "WAQI returns one live snapshot per refresh — not a 24h history. "
+                "The trend chart fills in as you refresh (every ~15 min). "
+                "Until then, here is the model forecast."
+            )
+            fc_12 = fc_df[fc_df["hours_ahead"] <= 12] if "hours_ahead" in fc_df.columns else fc_df.head(48)
+            if not fc_12.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=fc_12["hours_ahead"], y=fc_12["aqi"],
+                    name="Forecast AQI", line=dict(color="#F59E0B"),
+                ))
+                fig.update_layout(
+                    template="plotly_dark", height=300,
+                    xaxis_title="Hours ahead", yaxis_title="Live AQI (WAQI)",
+                    margin=dict(l=0, r=0, t=30, b=0),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Refresh again in a few minutes to start building a historical trend.")
 
 elif tab == "🗂 Source Attribution":
     st.markdown("### Source Attribution (XGBoost)")
