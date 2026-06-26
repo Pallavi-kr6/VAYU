@@ -14,8 +14,9 @@ from loguru import logger
 from datetime import datetime
 
 from agents.vayu_agents import VAYUOrchestrator
-from data.download_data import fetch_openweather_live, generate_live_synthetic
-from config.settings import CITIES, OPENWEATHER_API_KEY
+from data.download_data import fetch_openweather_live
+from data.preprocess import engineer_features
+from config.settings import CITIES, OPENWEATHER_API_KEY, WAQI_API_KEY
 
 orchestrator = VAYUOrchestrator()
 
@@ -25,7 +26,10 @@ def refresh_all_cities():
     logger.info(f"⏰ Scheduled refresh — {datetime.utcnow().strftime('%H:%M:%S UTC')}")
     for city in CITIES:
         try:
-            df = fetch_openweather_live(city, api_key=OPENWEATHER_API_KEY)
+            raw_df, _ = fetch_openweather_live(
+                city, api_key=OPENWEATHER_API_KEY, waqi_api_key=WAQI_API_KEY,
+            )
+            df = engineer_features(raw_df)
             orchestrator.run_city(city, df)
             logger.info(f"  ✓ {city}")
         except Exception as e:

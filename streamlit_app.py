@@ -86,7 +86,7 @@ with st.sidebar:
     ])
     st.markdown("---")
     st.markdown("**Data Sources**")
-    st.markdown("● OpenWeather Air Pollution API")
+    st.markdown("● WAQI Air Quality API")
     st.markdown("● OpenWeather Weather API")
     st.markdown("● Trained XGBoost + LSTM models")
     st.markdown("---")
@@ -111,7 +111,7 @@ hist = dash.get("historical_trend", [])
 current_aqi = int(summary.get("current_aqi") or 0)
 current_pm25 = float(summary.get("current_pm25") or attr.get("current_pm25") or 0)
 aqi_cat = summary.get("aqi_category") or attr.get("aqi_category", "Unknown")
-aqi_label = summary.get("aqi_label", "Derived AQI (CPCB)")
+aqi_label = summary.get("aqi_label", "Live AQI (WAQI)")
 confidence = float(summary.get("confidence") or attr.get("overall_confidence") or 0)
 aqi_cat_col, aqi_col = aqi_info(current_aqi)
 
@@ -131,23 +131,20 @@ hist_df = pd.DataFrame(hist)
 if not hist_df.empty and "datetime" in hist_df.columns:
     hist_df["datetime"] = pd.to_datetime(hist_df["datetime"])
     if "aqi" not in hist_df.columns and "pm25" in hist_df.columns:
-        from data.aqi_utils import compute_cpcb_aqi
-        hist_df["aqi"] = [
-            compute_cpcb_aqi(r["pm25"], r.get("pm10", r["pm25"] * 1.8))[0]
-            for _, r in hist_df.iterrows()
-        ]
+        from data.aqi_utils import us_aqi_from_pm25
+        hist_df["aqi"] = hist_df["pm25"].apply(us_aqi_from_pm25)
 
 if tab == "📊 Overview":
     st.markdown(f"## {city} — Air Quality Overview")
-    ow = live.get("openweather_aqi", {})
+    ow = live.get("pollution_source", "WAQI")
     st.caption(
-        f"{aqi_label} · OpenWeather: {ow.get('display', 'N/A')} · "
+        f"{aqi_label} · Pollution: {ow} · Weather: OpenWeather · "
         f"Updated: {dash.get('last_updated', '')}"
     )
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(f'<div class="metric-card"><div class="metric-val" style="color:{aqi_col}">{current_aqi}</div><div class="metric-lbl">Derived AQI (CPCB)</div><div style="color:{aqi_col}">{aqi_cat}</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><div class="metric-val" style="color:{aqi_col}">{current_aqi}</div><div class="metric-lbl">Live AQI (WAQI)</div><div style="color:{aqi_col}">{aqi_cat}</div></div>', unsafe_allow_html=True)
     with c2:
         st.markdown(f'<div class="metric-card"><div class="metric-val">{current_pm25:.1f}</div><div class="metric-lbl">PM2.5 µg/m³ (live)</div></div>', unsafe_allow_html=True)
     with c3:
@@ -173,8 +170,8 @@ elif tab == "📈 Forecast":
     st.markdown("### 48-Hour Forecast (LSTM)")
     if not fc_df.empty:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=fc_df["hours_ahead"], y=fc_df["aqi"], name="AQI (CPCB)", line=dict(color="#F59E0B")))
-        fig.update_layout(template="plotly_dark", height=400, xaxis_title="Hours ahead", yaxis_title="AQI (CPCB)")
+        fig.add_trace(go.Scatter(x=fc_df["hours_ahead"], y=fc_df["aqi"], name="Live AQI (WAQI) forecast", line=dict(color="#F59E0B")))
+        fig.update_layout(template="plotly_dark", height=400, xaxis_title="Hours ahead", yaxis_title="Live AQI (WAQI)")
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(fc_df[["hours_ahead", "pm25_pred", "aqi_pred", "aqi_category"]].head(48) if "pm25_pred" in fc_df.columns else fc_df.head(48))
     else:
@@ -198,7 +195,7 @@ elif tab == "🌍 Multi-City":
             rows.append({
                 "City": c.title(),
                 "PM2.5": d.get("current_pm25"),
-                "AQI (CPCB)": d.get("current_aqi"),
+                "Live AQI (WAQI)": d.get("current_aqi"),
                 "Confidence": f"{int((d.get('confidence') or 0) * 100)}%",
                 "Dominant": d.get("dominant_source"),
             })

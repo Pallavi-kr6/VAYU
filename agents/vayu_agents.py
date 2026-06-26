@@ -105,22 +105,27 @@ class SourceAttributionAgent:
 
         result = self.model.predict(recent_df)
 
-        from data.aqi_utils import compute_cpcb_aqi
+        from data.aqi_utils import waqi_aqi_category
+
         current_pm25 = float(recent_df["pm25"].iloc[-1])
         current_pm10 = float(
             recent_df["pm10"].iloc[-1] if "pm10" in recent_df.columns
             else current_pm25 * 1.8
         )
-        cpcb_aqi, cpcb_cat = compute_cpcb_aqi(current_pm25, current_pm10)
+        if "aqi" in recent_df.columns:
+            live_aqi = int(recent_df["aqi"].iloc[-1])
+        else:
+            from data.aqi_utils import us_aqi_from_pm25
+            live_aqi = us_aqi_from_pm25(current_pm25)
 
         result["city"]              = city
         result["timestamp"]         = datetime.utcnow().isoformat()
         result["current_pm25"]      = current_pm25
         result["current_pm10"]      = current_pm10
-        result["current_aqi"]       = cpcb_aqi
-        result["aqi_category"]      = cpcb_cat
-        result["aqi_source"]        = "cpcb_india"
-        result["aqi_label"]         = f"Derived AQI (CPCB) {cpcb_aqi} ({cpcb_cat})"
+        result["current_aqi"]       = live_aqi
+        result["aqi_category"]      = waqi_aqi_category(live_aqi)
+        result["aqi_source"]        = "waqi"
+        result["aqi_label"]         = f"Live AQI (WAQI) {live_aqi}"
 
         BUS.set(f"attribution_{city}", result)
         from db.supabase_store import SupabaseStore
@@ -138,9 +143,8 @@ class SourceAttributionAgent:
 
     @staticmethod
     def _pm25_to_aqi(pm25: float) -> int:
-        from data.aqi_utils import compute_cpcb_aqi
-        aqi, _ = compute_cpcb_aqi(pm25, pm25 * 1.8)
-        return aqi
+        from data.aqi_utils import us_aqi_from_pm25
+        return us_aqi_from_pm25(pm25)
 
 
 # ════════════════════════════════════════════════════════
@@ -508,7 +512,7 @@ class MultiCityComparativeAgent:
             insights = []
             for city, d in report["cities"].items():
                 insights.append(
-                    f"{city.title()}: CPCB AQI {d.get('current_aqi')} — "
+                    f"{city.title()}: Live AQI (WAQI) {d.get('current_aqi')} — "
                     f"dominant source {d.get('dominant_source')} "
                     f"(confidence {int(d.get('confidence', 0) * 100)}%)."
                 )
@@ -582,12 +586,14 @@ class VAYUOrchestrator:
 
 # ── Quick test (requires OPENWEATHER_API_KEY in .env)
 if __name__ == "__main__":
-    from config.settings import OPENWEATHER_API_KEY
+    from config.settings import OPENWEATHER_API_KEY, WAQI_API_KEY
     from data.download_data import fetch_openweather_live
     from data.preprocess import engineer_features
 
     orchestrator = VAYUOrchestrator()
-    raw_df, _ = fetch_openweather_live("delhi", api_key=OPENWEATHER_API_KEY)
+    raw_df, _ = fetch_openweather_live(
+        "delhi", api_key=OPENWEATHER_API_KEY, waqi_api_key=WAQI_API_KEY,
+    )
     feat_df = engineer_features(raw_df)
     result = orchestrator.run_city("delhi", feat_df)
 

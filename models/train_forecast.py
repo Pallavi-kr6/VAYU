@@ -361,7 +361,9 @@ class ForecastInference:
         if model_path is None:
             model_path = str(MODELS_DIR / "forecast_best.pt")
 
-        checkpoint   = torch.load(model_path, map_location=DEVICE)
+        checkpoint   = torch.load(model_path, map_location=DEVICE,
+    weights_only=False
+)
         self.features = checkpoint["features"]
         cfg           = checkpoint["config"]
 
@@ -391,14 +393,14 @@ class ForecastInference:
         Returns DataFrame with pm25_pred, aqi_pred, aqi_category
         """
         from data.preprocess import engineer_features
-        from data.aqi_utils import compute_cpcb_aqi, aqi_category
+        from data.aqi_utils import waqi_aqi_category, scale_aqi_from_pm25
 
         feat_df = engineer_features(recent_df)
         feat_cols = [f for f in self.features if f in feat_df.columns]
         seq_len = FORECAST_CONFIG["sequence_len"]
 
-        X_raw = feat_df[feat_cols].values[-seq_len:]
-        if len(X_raw) < seq_len:
+        X_df = feat_df[feat_cols].tail(seq_len).copy()
+        if len(X_df) < seq_len:
             raise ValueError(f"Need at least {seq_len} engineered rows for forecast; got {len(X_raw)}")
 
         current_pm25 = float(recent_df["pm25"].iloc[-1])
@@ -406,9 +408,14 @@ class ForecastInference:
             recent_df["pm10"].iloc[-1] if "pm10" in recent_df.columns
             else current_pm25 * 1.8
         )
+        if "aqi" in recent_df.columns:
+            live_aqi = int(recent_df["aqi"].iloc[-1])
+        else:
+            from data.aqi_utils import us_aqi_from_pm25
+            live_aqi = us_aqi_from_pm25(current_pm25)
         pm10_ratio = current_pm10 / max(current_pm25, 1.0)
 
-        X_scaled = self.scaler.transform(X_raw)
+        X_scaled = self.scaler.transform(X_df)
         X_tensor = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
         pred_raw = self.model(X_tensor, teacher_forcing_ratio=0.0)
@@ -438,8 +445,8 @@ class ForecastInference:
         results = []
         for i, pm25 in enumerate(pm25_inv):
             pm10 = pm25 * pm10_ratio
-            aqi_val, aqi_cat = compute_cpcb_aqi(pm25, pm10)
-            aqi_val = int(np.clip(aqi_val, 0, 500))
+            aqi_val = scale_aqi_from_pm25(live_aqi, current_pm25, pm25)
+            aqi_cat = waqi_aqi_category(aqi_val)
             results.append({
                 "step_15min":    i + 1,
                 "hours_ahead":   round((i + 1) * 0.25, 2),
@@ -450,7 +457,7 @@ class ForecastInference:
             })
 
         aqi_vals = [r["aqi_pred"] for r in results[:10]]
-        logger.info(f"AQI forecast (CPCB): {aqi_vals}")
+        logger.info(f"AQI forecast (WAQI-scaled): {aqi_vals}")
 
         return pd.DataFrame(results)
 

@@ -66,112 +66,172 @@ def download_kaggle_datasets():
 
 
 # ─────────────────────────────────────────────────────────
-# 2. OPENWEATHER LIVE API  (15-minute AQI readings)
+# 2. LIVE INGESTION — WAQI pollutants + OpenWeather meteorology
 # ─────────────────────────────────────────────────────────
 OPENWEATHER_API_BASE = "https://api.openweathermap.org/data/2.5"
 
-def fetch_openweather_live(city: str, api_key: str = None) -> tuple[pd.DataFrame, dict]:
-    """
-    Fetch live air quality + weather from OpenWeather.
 
-    Returns (DataFrame, metadata dict). No synthetic fallback — API key required.
-    Historical window uses repeated current reading (OpenWeather free tier = 1 point);
-    time features still vary across the 96 timesteps.
+def _fetch_openweather_weather(lat: float, lon: float, api_key: str) -> dict:
+    """OpenWeather current weather — temp, humidity, wind, pressure, rain."""
+    resp = requests.get(
+        f"{OPENWEATHER_API_BASE}/weather",
+        params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    wx = resp.json()
+    rain = wx.get("rain") or {}
+    rain_1h = float(rain.get("1h", rain.get("3h", 0)) or 0)
+    return {
+        "temp":        float(wx["main"]["temp"]),
+        "humidity":    float(wx["main"]["humidity"]),
+        "pressure":    float(wx["main"].get("pressure", 1013)),
+        "wind_speed":  float(wx["wind"].get("speed", 0)),
+        "wind_dir":    float(wx["wind"].get("deg", 0)),
+        "rainfall_mm": rain_1h,
+    }
+
+
+def _fetch_openweather_air_pollution(lat: float, lon: float, api_key: str) -> dict:
     """
+    OpenWeather Air Pollution API — fallback when WAQI is unavailable.
+    Returns pollutants on OpenWeather's component scale.
+    """
+    resp = requests.get(
+        f"{OPENWEATHER_API_BASE}/air_pollution",
+        params={"lat": lat, "lon": lon, "appid": api_key},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    ap = resp.json()["list"][0]
+    components = ap["components"]
+    ow_aqi = int(ap["main"]["aqi"])
+    return {
+        "aqi":  ow_aqi * 20,  # rough mapping 1–5 → 20–100 for pipeline continuity
+        "pm25": float(components.get("pm2_5", 0)),
+        "pm10": float(components.get("pm10", 0)),
+        "no2":  float(components.get("no2", 0)),
+        "so2":  float(components.get("so2", 0)),
+        "co":   float(components.get("co", 0)),
+        "o3":   float(components.get("o3", 0)),
+        "source": "OpenWeather",
+        "openweather_aqi_1_5": ow_aqi,
+    }
+
+
+def fetch_openweather_live(
+    city: str,
+    api_key: str = None,
+    waqi_api_key: str = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Live pipeline: WAQI for AQI + pollutants, OpenWeather for meteorology.
+
+    Why split sources:
+      - WAQI aggregates ground monitoring stations → realistic city AQI in India.
+      - OpenWeather excels at weather fields (temp, humidity, wind, pressure, rain)
+        used by forecast / attribution feature engineering.
+
+    Falls back to OpenWeather Air Pollution if WAQI fails (logged as warning).
+    """
+    from config.settings import CITIES, WAQI_API_KEY
+    from data.fetch_waqi import fetch_waqi_live
+    from data.aqi_utils import format_waqi_aqi, format_openweather_aqi, pollutant_or_default
+
     if not api_key:
-        raise RuntimeError(
-            "OPENWEATHER_API_KEY is required. Set it in .env — no synthetic fallback."
-        )
-
-    from config.settings import CITIES
-    from data.aqi_utils import format_openweather_aqi, compute_cpcb_aqi
+        raise RuntimeError("OPENWEATHER_API_KEY is required for weather data.")
 
     coords = CITIES.get(city.lower())
     if not coords:
         raise ValueError(f"Unknown city '{city}'")
 
     lat, lon = coords["lat"], coords["lon"]
-    OW_BASE  = "https://api.openweathermap.org/data/2.5"
+    waqi_key = waqi_api_key or WAQI_API_KEY
 
-    ap_resp = requests.get(
-        f"{OW_BASE}/air_pollution",
-        params={"lat": lat, "lon": lon, "appid": api_key},
-        timeout=10,
-    )
-    ap_resp.raise_for_status()
-    ap = ap_resp.json()["list"][0]
+    wx = _fetch_openweather_weather(lat, lon, api_key)
 
-    components = ap["components"]
-    ow_aqi     = int(ap["main"]["aqi"])
+    pollution_source = "WAQI"
+    waqi_data = None
+    try:
+        waqi_data = fetch_waqi_live(city, api_key=waqi_key, lat=lat, lon=lon)
+    except Exception as e:
+        logger.warning(f"WAQI failed for {city}: {e} — falling back to OpenWeather Air Pollution")
+        ow_poll = _fetch_openweather_air_pollution(lat, lon, api_key)
+        pollution_source = "OpenWeather"
+        waqi_data = {
+            "city":   city.lower(),
+            "aqi":    int(ow_poll["aqi"]),
+            "pm25":   ow_poll["pm25"],
+            "pm10":   ow_poll["pm10"],
+            "no2":    ow_poll["no2"],
+            "so2":    ow_poll["so2"],
+            "co":     ow_poll["co"],
+            "o3":     ow_poll["o3"],
+            "source": "OpenWeather",
+            "openweather_aqi_1_5": ow_poll.get("openweather_aqi_1_5"),
+        }
 
-    wx_resp = requests.get(
-        f"{OW_BASE}/weather",
-        params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric"},
-        timeout=10,
-    )
-    wx_resp.raise_for_status()
-    wx = wx_resp.json()
+    aqi   = int(waqi_data["aqi"])
+    pm25  = pollutant_or_default(waqi_data.get("pm25"))
+    pm10  = pollutant_or_default(waqi_data.get("pm10"), pm25 * 1.8 if pm25 else 0)
+    no2   = pollutant_or_default(waqi_data.get("no2"))
+    so2   = pollutant_or_default(waqi_data.get("so2"))
+    co    = pollutant_or_default(waqi_data.get("co"))
+    o3    = pollutant_or_default(waqi_data.get("o3"))
 
-    now    = pd.Timestamp.utcnow()
-    pm25   = float(components.get("pm2_5", 0))
-    pm10   = float(components.get("pm10", pm25 * 1.8))
-    no2    = float(components.get("no2", 0))
-    so2    = float(components.get("so2", 0))
-    co     = float(components.get("co", 0))
-    o3     = float(components.get("o3", 0))
-    temp   = float(wx["main"]["temp"])
-    hum    = float(wx["main"]["humidity"])
-    ws     = float(wx["wind"].get("speed", 0))
-    wd     = float(wx["wind"].get("deg", 0))
-    pblh   = 800.0
-
-    cpcb_aqi, cpcb_cat = compute_cpcb_aqi(pm25, pm10)
+    now = pd.Timestamp.utcnow()
+    pblh = 800.0
 
     rows = []
     for i in range(96):
         ts = now - pd.Timedelta(minutes=15 * (95 - i))
         rows.append({
-            "station":    f"{city.title()} (OpenWeather)",
+            "station":    f"{city.title()} ({pollution_source})",
             "lat":        lat,
             "lon":        lon,
             "datetime":   ts,
+            "aqi":        aqi,
             "pm25":       round(pm25, 2),
             "pm10":       round(pm10, 2),
             "no2":        round(no2, 2),
             "so2":        round(so2, 2),
             "co":         round(co, 2),
             "o3":         round(o3, 2),
-            "temp":       round(temp, 1),
-            "humidity":   round(hum, 1),
-            "wind_speed": round(ws, 2),
-            "wind_dir":   round(wd, 0),
+            "temp":       round(wx["temp"], 1),
+            "humidity":   round(wx["humidity"], 1),
+            "pressure":   round(wx["pressure"], 1),
+            "wind_speed": round(wx["wind_speed"], 2),
+            "wind_dir":   round(wx["wind_dir"], 0),
+            "rainfall":   round(wx["rainfall_mm"], 2),
             "pblh":       pblh,
             "city":       city.title(),
         })
 
     df = pd.DataFrame(rows)
     meta = {
-        "source":              "openweather",
+        "pollution_source":    pollution_source,
+        "weather_source":      "openweather",
         "city":                city.lower(),
         "fetched_at":          now.isoformat(),
+        "aqi":                 aqi,
+        "waqi":                waqi_data,
         "pm25_ug_m3":          round(pm25, 2),
         "pm10_ug_m3":          round(pm10, 2),
-        "temp_c":              round(temp, 1),
-        "humidity_pct":        round(hum, 1),
-        "wind_speed_ms":       round(ws, 2),
-        "openweather_aqi":     format_openweather_aqi(ow_aqi),
-        "cpcb_aqi":            {
-            "value":   cpcb_aqi,
-            "category": cpcb_cat,
-            "label":   f"Derived AQI (CPCB) {cpcb_aqi} ({cpcb_cat})",
-            "scale":   "cpcb_india",
-        },
-        "aqi_display_primary": "cpcb",
+        "temp_c":              round(wx["temp"], 1),
+        "humidity_pct":        round(wx["humidity"], 1),
+        "pressure_hpa":        round(wx["pressure"], 1),
+        "wind_speed_ms":       round(wx["wind_speed"], 2),
+        "rainfall_mm":         round(wx["rainfall_mm"], 2),
+        "aqi_display":         format_waqi_aqi(aqi) if pollution_source == "WAQI" else format_openweather_aqi(
+            waqi_data.get("openweather_aqi_1_5", max(1, min(5, aqi // 20)))
+        ),
+        "aqi_label":           f"Live AQI (WAQI) {aqi}" if pollution_source == "WAQI" else f"Live AQI (OpenWeather fallback) {aqi}",
+        "aqi_display_primary": "waqi" if pollution_source == "WAQI" else "openweather_fallback",
     }
 
     logger.success(
-        f"OpenWeather [{city}]: PM2.5={pm25} µg/m³  "
-        f"CPCB AQI={cpcb_aqi}  OW AQI={ow_aqi}  temp={temp}°C"
+        f"Live [{city}] source={pollution_source} AQI={aqi} PM2.5={pm25} PM10={pm10} "
+        f"temp={wx['temp']}°C wind={wx['wind_speed']}m/s"
     )
     return df, meta
 

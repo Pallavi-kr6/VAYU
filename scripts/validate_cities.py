@@ -1,4 +1,4 @@
-"""Run validation across all 6 cities (requires OPENWEATHER_API_KEY)."""
+"""Run validation across all 6 cities (requires OPENWEATHER_API_KEY + WAQI_API_KEY)."""
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from config.settings import OPENWEATHER_API_KEY, CITIES
+from config.settings import OPENWEATHER_API_KEY, WAQI_API_KEY, CITIES
 from data.download_data import fetch_openweather_live
 from data.preprocess import engineer_features
 from models.train_attribution import AttributionInference
@@ -19,7 +19,9 @@ print("Models loaded OK\n")
 
 report = []
 for city in CITIES:
-    raw, meta = fetch_openweather_live(city, api_key=OPENWEATHER_API_KEY)
+    raw, meta = fetch_openweather_live(
+        city, api_key=OPENWEATHER_API_KEY, waqi_api_key=WAQI_API_KEY,
+    )
     feat = engineer_features(raw)
     attr = ai.predict(feat)
     fc = fi.predict(raw, n_steps=48)
@@ -27,9 +29,9 @@ for city in CITIES:
     top_enf = enf[0]["name"] if enf else "NONE"
     report.append({
         "city": city,
+        "source": meta.get("pollution_source"),
         "pm25": meta["pm25_ug_m3"],
-        "cpcb_aqi": meta["cpcb_aqi"]["value"],
-        "ow_aqi": meta["openweather_aqi"]["value"],
+        "waqi_aqi": meta["aqi"],
         "conf": attr["overall_confidence"],
         "dominant": attr["dominant_source"],
         "fc_peak_aqi": int(fc["aqi_pred"].max()),
@@ -38,15 +40,15 @@ for city in CITIES:
     })
 
 print("=" * 90)
-print("VAYU VALIDATION REPORT")
+print("VAYU VALIDATION REPORT (WAQI + OpenWeather weather)")
 print("=" * 90)
 for r in report:
     print(
-        f"{r['city']:12} PM2.5={r['pm25']:6.1f} CPCB={r['cpcb_aqi']:3} "
-        f"OW={r['ow_aqi']} conf={r['conf']:.2f} peak_fc_aqi={r['fc_peak_aqi']:3} "
-        f"peak_pm25={r['fc_peak_pm25']:.1f} enf={r['enforcement_top']}"
+        f"{r['city']:12} src={r['source']:10} PM2.5={r['pm25']:6.1f} "
+        f"WAQI={r['waqi_aqi']:3} conf={r['conf']:.2f} peak_fc={r['fc_peak_aqi']:3} "
+        f"enf={r['enforcement_top']}"
     )
 
 confs = [r["conf"] for r in report]
-print(f"\nConfidence: min={min(confs):.2f} max={max(confs):.2f} unique={len(set(confs))}")
+print(f"\nConfidence: min={min(confs):.2f} max={max(confs):.2f}")
 print(f"Unique enforcement tops: {len(set(r['enforcement_top'] for r in report))}/6")

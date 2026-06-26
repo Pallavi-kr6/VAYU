@@ -1,28 +1,10 @@
 # data/aqi_utils.py
 # ─────────────────────────────────────────────────────────
-# Single authoritative AQI path for VAYU (CPCB India standard).
-# OpenWeather uses a separate 1–5 scale — never mix with CPCB AQI.
+# AQI helpers aligned with WAQI / US EPA scale (0–500).
+# Live AQI comes from WAQI API; forecast uses the same category bands.
 # ─────────────────────────────────────────────────────────
 
-from typing import Tuple
-
-# CPCB sub-index breakpoints (µg/m³ for PM, ppb/µg for gases)
-_PM25_BPS = [
-    (0, 30, 0, 50, "Good"),
-    (30, 60, 51, 100, "Satisfactory"),
-    (60, 90, 101, 200, "Moderate"),
-    (90, 120, 201, 300, "Poor"),
-    (120, 250, 301, 400, "Very Poor"),
-    (250, 500, 401, 500, "Severe"),
-]
-_PM10_BPS = [
-    (0, 50, 0, 50, "Good"),
-    (50, 100, 51, 100, "Satisfactory"),
-    (100, 250, 101, 200, "Moderate"),
-    (250, 350, 201, 300, "Poor"),
-    (350, 430, 301, 400, "Very Poor"),
-    (430, 600, 401, 500, "Severe"),
-]
+from typing import Optional, Tuple
 
 OPENWEATHER_AQI_LABELS = {
     1: "Good",
@@ -32,42 +14,67 @@ OPENWEATHER_AQI_LABELS = {
     5: "Very Poor",
 }
 
-
-def sub_index(value: float, breakpoints: list) -> Tuple[int, str]:
-    for lo_c, hi_c, lo_i, hi_i, cat in breakpoints:
-        if lo_c <= value <= hi_c:
-            aqi = (hi_i - lo_i) / (hi_c - lo_c) * (value - lo_c) + lo_i
-            return round(aqi), cat
-    return 500, "Severe"
-
-
-def compute_cpcb_aqi(pm25: float, pm10: float) -> Tuple[int, str]:
-    """CPCB National Air Quality Index (PM2.5 + PM10 sub-indices, max wins)."""
-    pm25 = max(0.0, float(pm25))
-    pm10 = max(0.0, float(pm10))
-    aqi25, cat25 = sub_index(pm25, _PM25_BPS)
-    aqi10, cat10 = sub_index(pm10, _PM10_BPS)
-    aqi = max(aqi25, aqi10)
-    cat = cat25 if aqi25 >= aqi10 else cat10
-    return int(aqi), cat
+# US EPA PM2.5 breakpoints (µg/m³) — used only when deriving AQI from PM2.5 alone
+_US_PM25_BPS = [
+    (0.0,   12.0,   0,   50),
+    (12.1,  35.4,   51,  100),
+    (35.5,  55.4,   101, 150),
+    (55.5,  150.4,  151, 200),
+    (150.5, 250.4,  201, 300),
+    (250.5, 500.4,  301, 500),
+]
 
 
-def aqi_category(aqi: int) -> str:
+def waqi_aqi_category(aqi: int) -> str:
+    """US EPA / WAQI category labels."""
     if aqi <= 50:
         return "Good"
     if aqi <= 100:
-        return "Satisfactory"
-    if aqi <= 200:
         return "Moderate"
+    if aqi <= 150:
+        return "Unhealthy for Sensitive Groups"
+    if aqi <= 200:
+        return "Unhealthy"
     if aqi <= 300:
-        return "Poor"
-    if aqi <= 400:
-        return "Very Poor"
-    return "Severe"
+        return "Very Unhealthy"
+    return "Hazardous"
+
+
+def aqi_category(aqi: int) -> str:
+    """Alias used by agents — WAQI/US EPA categories."""
+    return waqi_aqi_category(aqi)
+
+
+def us_aqi_from_pm25(pm25: float) -> int:
+    """Estimate US EPA AQI from PM2.5 when WAQI index is not available."""
+    pm25 = max(0.0, float(pm25))
+    for lo_c, hi_c, lo_i, hi_i in _US_PM25_BPS:
+        if lo_c <= pm25 <= hi_c:
+            return int(round((hi_i - lo_i) / (hi_c - lo_c) * (pm25 - lo_c) + lo_i))
+    return 500
+
+
+def compute_aqi(pm25: float, pm10: float) -> Tuple[int, str]:
+    """
+    Training / feature-engineering helper: US EPA AQI from PM2.5 and PM10.
+    Uses max of PM2.5-based index and a PM10-scaled proxy when PM10 is present.
+    """
+    aqi25 = us_aqi_from_pm25(pm25)
+    aqi10 = us_aqi_from_pm25(pm10 / 1.8) if pm10 else aqi25
+    aqi = int(max(aqi25, aqi10))
+    return aqi, waqi_aqi_category(aqi)
+
+
+def scale_aqi_from_pm25(current_aqi: int, current_pm25: float, predicted_pm25: float) -> int:
+    """Scale live WAQI AQI proportionally with forecast PM2.5."""
+    if current_pm25 <= 0:
+        return us_aqi_from_pm25(predicted_pm25)
+    ratio = predicted_pm25 / current_pm25
+    return int(max(0, min(500, round(current_aqi * ratio))))
 
 
 def format_openweather_aqi(ow_aqi: int) -> dict:
-    """OpenWeather 1–5 scale metadata (not CPCB)."""
+    """OpenWeather 1–5 scale (fallback pollution source only)."""
     label = OPENWEATHER_AQI_LABELS.get(int(ow_aqi), "Unknown")
     return {
         "value": int(ow_aqi),
@@ -75,3 +82,18 @@ def format_openweather_aqi(ow_aqi: int) -> dict:
         "label": label,
         "display": f"OpenWeather AQI {ow_aqi} ({label})",
     }
+
+
+def format_waqi_aqi(aqi: int) -> dict:
+    cat = waqi_aqi_category(aqi)
+    return {
+        "value":   int(aqi),
+        "scale":   "waqi_us_epa",
+        "category": cat,
+        "label":   f"Live AQI (WAQI) {aqi} ({cat})",
+        "display": f"Live AQI (WAQI) {aqi}",
+    }
+
+
+def pollutant_or_default(value: Optional[float], default: float = 0.0) -> float:
+    return float(value) if value is not None else default

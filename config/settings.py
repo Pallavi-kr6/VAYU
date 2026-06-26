@@ -21,7 +21,8 @@ for d in [DATA_DIR, MODELS_DIR, LOGS_DIR]:
 
 # ── API Keys (set in .env) ────────────────────────────────
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")         # console.groq.com — free
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")   # openweathermap.org/api (free)
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")   # openweathermap.org/api (weather)
+WAQI_API_KEY        = os.getenv("WAQI_API_KEY", "")           # aqicn.org/data-platform/token (pollutants)
 GEE_PROJECT         = os.getenv("GEE_PROJECT", "")           # Google Earth Engine (optional)
 TWILIO_SID         = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN       = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -46,7 +47,7 @@ CITIES = {
 # ── Pollutants tracked ────────────────────────────────────
 POLLUTANTS = ["pm25", "pm10", "no2", "so2", "co", "o3"]
 
-# ── AQI Breakpoints (CPCB standard) ──────────────────────
+# ── AQI display bands (WAQI / US EPA scale) ───────────────
 AQI_BREAKPOINTS = {
     "pm25": [
         (0,    30,   0,   50,  "Good"),

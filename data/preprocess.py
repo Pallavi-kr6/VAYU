@@ -24,7 +24,7 @@ PROCESSED_DIR = Path("data/processed")
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-from data.aqi_utils import compute_cpcb_aqi as compute_aqi
+from data.aqi_utils import compute_aqi
 
 
 # ── Feature Engineering ──────────────────────────────────

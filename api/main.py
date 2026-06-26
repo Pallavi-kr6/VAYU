@@ -72,10 +72,12 @@ async def startup():
 async def _refresh_city(city: str):
     """Pulls latest OpenWeather data, engineers features, runs agent pipeline."""
     global _last_run
-    from config.settings import OPENWEATHER_API_KEY
+    from config.settings import OPENWEATHER_API_KEY, WAQI_API_KEY
     from data.preprocess import engineer_features
 
-    raw_df, live_meta = fetch_openweather_live(city, api_key=OPENWEATHER_API_KEY)
+    raw_df, live_meta = fetch_openweather_live(
+        city, api_key=OPENWEATHER_API_KEY, waqi_api_key=WAQI_API_KEY,
+    )
     BUS.set(f"live_{city}", live_meta)
 
     hist_records = []
@@ -271,9 +273,10 @@ async def get_dashboard(city: str):
             "current_pm25":     attr.get("current_pm25"),
             "current_aqi":      attr.get("current_aqi"),
             "aqi_category":     attr.get("aqi_category") or _aqi_to_cat(attr.get("current_aqi", 0)),
-            "aqi_source":       attr.get("aqi_source", "cpcb_india"),
-            "aqi_label":        attr.get("aqi_label", "Derived AQI (CPCB)"),
-            "openweather_aqi":  live.get("openweather_aqi"),
+            "aqi_source":       attr.get("aqi_source", "waqi"),
+            "aqi_label":        attr.get("aqi_label", "Live AQI (WAQI)"),
+            "pollution_source": live.get("pollution_source"),
+            "waqi":             live.get("waqi"),
             "dominant_source":  attr.get("dominant_source"),
             "confidence":       attr.get("overall_confidence"),
             "pending_actions":  len(enf),
@@ -397,9 +400,10 @@ async def debug_city(city: str):
             "forecast":    "ForecastInference (BiLSTM)",
         },
         "data_lineage": {
-            "pm25":     "OpenWeather Air Pollution API → engineer_features → models",
-            "aqi":      "compute_cpcb_aqi(pm25, pm10) — Derived AQI (CPCB)",
-            "forecast": "LSTM on scaled features → inverse scaler → CPCB AQI",
+            "pm25":        "WAQI API (fallback: OpenWeather Air Pollution) → engineer_features → models",
+            "aqi":         "WAQI live index (US EPA scale 0–500)",
+            "weather":     "OpenWeather Weather API → temp, humidity, wind, pressure, rain",
+            "forecast":    "LSTM PM2.5 → scaled from live WAQI AQI",
             "enforcement": "city enforcement_assets + attribution scores",
         },
     }
