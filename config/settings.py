@@ -71,14 +71,14 @@ FORECAST_CONFIG = {
     "sequence_len":   48,          # KEEP
     "forecast_len":   192,         # KEEP if you need 48h forecast
 
-    "hidden_size":    192,         # CHANGE from 256 -> 192
+    "hidden_size":    256,         # CHANGE from 256 -> 192
     "num_layers":     2,           # CHANGE from 3 -> 2
-    "dropout":        0.2,
+    "dropout":        0.15,
 
-    "batch_size":     256,         # CHANGE from 64 -> 256
+    "batch_size":     128,         # CHANGE from 64 -> 256
     "epochs":         20,          # CHANGE from 50 -> 20
-    "lr":             1e-3,
-    "early_stop":     3,           # CHANGE from 7 -> 3
+    "lr":             5e-4,
+    "early_stop":     7,           # CHANGE from 7 -> 3
 
     "features":       POLLUTANTS + [
         "temp",
