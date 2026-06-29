@@ -9,6 +9,7 @@
 
 import os, json, zipfile, subprocess
 from pathlib import Path
+import numpy as np
 import pandas as pd
 import requests
 from loguru import logger
@@ -179,35 +180,60 @@ def fetch_openweather_live(
     co    = pollutant_or_default(waqi_data.get("co"))
     o3    = pollutant_or_default(waqi_data.get("o3"))
 
-    now = pd.Timestamp.utcnow()
+    now = pd.Timestamp.utcnow().tz_localize(None)
     pblh = 800.0
 
-    rows = []
-    for i in range(96):
-        ts = now - pd.Timedelta(minutes=15 * (95 - i))
-        rows.append({
-            "station":    f"{city.title()} ({pollution_source})",
-            "lat":        lat,
-            "lon":        lon,
-            "datetime":   ts,
-            "aqi":        aqi,
-            "pm25":       round(pm25, 2),
-            "pm10":       round(pm10, 2),
-            "no2":        round(no2, 2),
-            "so2":        round(so2, 2),
-            "co":         round(co, 2),
-            "o3":         round(o3, 2),
-            "temp":       round(wx["temp"], 1),
-            "humidity":   round(wx["humidity"], 1),
-            "pressure":   round(wx["pressure"], 1),
-            "wind_speed": round(wx["wind_speed"], 2),
-            "wind_dir":   round(wx["wind_dir"], 0),
-            "rainfall":   round(wx["rainfall_mm"], 2),
-            "pblh":       pblh,
-            "city":       city.title(),
-        })
+    from db.supabase_store import SupabaseStore
 
-    df = pd.DataFrame(rows)
+    history = SupabaseStore.get_recent_readings(city, limit=95)
+    
+    # Standardize column name and timezone early
+    if "recorded_at" in history.columns:
+        history = history.rename(columns={"recorded_at": "datetime"})
+        if pd.api.types.is_datetime64_any_dtype(history["datetime"]):
+            history["datetime"] = history["datetime"].dt.tz_localize(None)
+    
+    if "city" in history.columns:
+        history["city"] = history["city"].str.lower()
+
+    if len(history) < 95:
+        synthetic = generate_live_synthetic(city)
+        needed = 95 - len(history)
+        history = pd.concat(
+            [synthetic.tail(needed), history],
+            ignore_index=True,
+        )
+
+    # Build current reading from live API data
+    current_reading = {
+        "datetime":     now,
+        "city":         city.lower(),
+        "aqi":          aqi,
+        "pm25":         pm25,
+        "pm10":         pm10,
+        "no2":          no2,
+        "so2":          so2,
+        "co":           co,
+        "o3":           o3,
+        "temp":         wx["temp"],
+        "humidity":     wx["humidity"],
+        "pressure":     wx["pressure"],
+        "wind_speed":   wx["wind_speed"],
+        "wind_dir":     wx["wind_dir"],
+        "rainfall_mm":  wx["rainfall_mm"],
+        "pblh":         pblh,
+    }
+
+    # Pandas 2.x: use pd.concat instead of DataFrame.append
+    history = pd.concat(
+        [history, pd.DataFrame([current_reading])],
+        ignore_index=True,
+    )
+
+    # Trim to last 96 rows
+    history = history.tail(96).reset_index(drop=True)
+
+    df = history
     meta = {
         "pollution_source":    pollution_source,
         "weather_source":      "openweather",
@@ -332,7 +358,6 @@ def download_sentinel5p(city: str, start: str, end: str, save_path: Path):
 # ─────────────────────────────────────────────────────────
 # 4. SYNTHETIC DATA GENERATOR (for local demo / no API keys)
 # ─────────────────────────────────────────────────────────
-import numpy as np
 
 def create_synthetic_aqi_data(out_dir: Path, name: str):
     """
@@ -413,7 +438,7 @@ def generate_live_synthetic(city: str) -> pd.DataFrame:
             "lat":        28.6 if city.lower() == "delhi" else 19.0,
             "lon":        77.2 if city.lower() == "delhi" else 72.8,
             "datetime":   ts,
-            "city":       city.title(),
+            "city":       city.lower(),
             "pm25":       round(pm25, 1),
             "pm10":       round(pm25 * 1.8, 1),
             "no2":        round(pm25 * 0.35, 1),
@@ -479,4 +504,4 @@ def create_source_attribution_labels(aqi_df: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     logger.info("═══ VAYU Data Download ═══")
     download_kaggle_datasets()
-    logger.success("Data download complete. Run: python data/preprocess.py")
+    logger.success("Data download complete. Run: python data/preprocess.py")    

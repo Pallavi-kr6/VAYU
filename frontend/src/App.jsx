@@ -12,7 +12,8 @@ import {
 } from "recharts";
 
 // ── Config ────────────────────────────────────────────────
-const API = "http://localhost:8000/api";
+// Dev: use relative "/api" (proxied to :8000 via package.json). Prod: set REACT_APP_API_URL.
+const API = process.env.REACT_APP_API_URL || "/api";
 
 const CITIES = ["delhi", "mumbai", "bengaluru", "kolkata", "chennai", "hyderabad"];
 
@@ -53,15 +54,22 @@ function aqiCategory(aqi) {
 }
 
 // ── API helpers ────────────────────────────────────────────
-async function apiFetch(path) {
-  try {
-    const r = await fetch(`${API}${path}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } catch (e) {
-    console.warn(`API error ${path}:`, e.message);
-    return null;
+async function apiFetch(path, { retries = 3, delayMs = 2000 } = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const r = await fetch(`${API}${path}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+      }
+    }
   }
+  console.warn(`API error ${path}:`, lastErr?.message);
+  return null;
 }
 
 // ── Mock data (shown when API is offline) ─────────────────
@@ -489,9 +497,11 @@ export default function App() {
   const [data,    setData]    = useState(null);
   const [loading, setLoading] = useState(true);
   const [apiLive, setApiLive] = useState(false);
+  const [apiError, setApiError] = useState(null);
 
   const loadData = useCallback(async (c) => {
     setLoading(true);
+    setApiError(null);
     const result = await apiFetch(`/dashboard/${c}`);
     if (result) {
       setData(result);
@@ -499,6 +509,10 @@ export default function App() {
     } else {
       setData(mockDashboard(c));
       setApiLive(false);
+      setApiError(
+        `Could not reach the API at ${API}. Start the backend with ` +
+        "`uvicorn api.main:app --reload --port 8000`, wait for startup to finish, then click Refresh."
+      );
     }
     setLoading(false);
   }, []);
@@ -568,7 +582,7 @@ export default function App() {
             background: apiLive ? "#10B981" : "#F59E0B",
             boxShadow: `0 0 6px ${apiLive ? "#10B981" : "#F59E0B"}`,
           }} />
-          <span style={{ fontSize: 10, color: "#94a3b8" }}>
+          <span style={{ fontSize: 10, color: "#94a3b8" }} title={apiError || undefined}>
             {apiLive ? "Live API" : "Demo Mode"}
           </span>
           <button onClick={() => loadData(city)} style={{
@@ -577,6 +591,15 @@ export default function App() {
           }}>↻ Refresh</button>
         </div>
       </div>
+
+      {!apiLive && apiError && (
+        <div style={{
+          margin: "0 20px", padding: "8px 12px", borderRadius: 8,
+          background: "#422006", border: "1px solid #F59E0B", color: "#FDE68A", fontSize: 12,
+        }}>
+          {apiError}
+        </div>
+      )}
 
       {/* ── Tabs ── */}
       <div style={{

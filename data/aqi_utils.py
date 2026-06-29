@@ -67,6 +67,9 @@ def compute_aqi(pm25: float, pm10: float) -> Tuple[int, str]:
 
 def scale_aqi_from_pm25(current_aqi: int, current_pm25: float, predicted_pm25: float) -> int:
     """Scale live WAQI AQI proportionally with forecast PM2.5."""
+    import math
+    if math.isnan(predicted_pm25) or math.isnan(current_pm25):
+        return current_aqi
     if current_pm25 <= 0:
         return us_aqi_from_pm25(predicted_pm25)
     ratio = predicted_pm25 / current_pm25

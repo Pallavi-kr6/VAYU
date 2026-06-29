@@ -62,31 +62,56 @@ class IntelligenceBus:
 
     def _hydrate_from_supabase(self):
         from db.supabase_store import SupabaseStore
+
         if not SupabaseStore.is_configured():
             return
+
         cached = SupabaseStore.load_all()
+
         if cached:
-            self._store.update(cached)
-            logger.info(f"IntelligenceBus hydrated {len(cached)} keys from Supabase")
+            for key, value in cached.items():
+                self._store[key] = {
+                    "data": value,
+                    "updated": datetime.utcnow().isoformat(),
+                }
+
+            logger.info(
+                f"IntelligenceBus hydrated {len(cached)} keys from Supabase"
+            )
 
     def set(self, key: str, value):
-        self._store[key] = {"data": value, "updated": datetime.utcnow().isoformat()}
+        self._store[key] = {
+            "data": value,
+            "updated": datetime.utcnow().isoformat(),
+        }
+
         from db.supabase_store import SupabaseStore
         SupabaseStore.set(key, value)
 
     def get(self, key: str):
         entry = self._store.get(key)
+
         if entry:
             return entry["data"]
+
         from db.supabase_store import SupabaseStore
+
         data = SupabaseStore.get(key)
+
         if data is not None:
-            self._store[key] = {"data": data, "updated": datetime.utcnow().isoformat()}
+            self._store[key] = {
+                "data": data,
+                "updated": datetime.utcnow().isoformat(),
+            }
             return data
+
         return None
 
-    def get_all(self) -> dict:
-        return {k: v["data"] for k, v in self._store.items()}
+    def get_all(self):
+        return {
+            k: v["data"]
+            for k, v in self._store.items()
+        }
 
 
 BUS = IntelligenceBus()
@@ -130,12 +155,12 @@ class SourceAttributionAgent:
         BUS.set(f"attribution_{city}", result)
         from db.supabase_store import SupabaseStore
         SupabaseStore.save_reading(
-            city=city,
-            pm25=result["current_pm25"],
-            pm10=result["current_pm25"] * 1.8,
-            aqi=result["current_aqi"],
-            pollutants={"dominant_source": result.get("dominant_source")},
-        )
+    city=city,
+    pm25=result["current_pm25"],
+    pm10=result["current_pm10"],
+    aqi=result["current_aqi"],
+    pollutants={"dominant_source": result.get("dominant_source")},
+)
         logger.info(f"  Dominant: {result['dominant_source']} "
                     f"({result['sources'][0]['pct']}%)  "
                     f"Confidence: {result['overall_confidence']}")
@@ -157,7 +182,8 @@ class PredictiveAQIAgent:
 
     def run(self, city: str, recent_df: pd.DataFrame, hours: int = 48) -> pd.DataFrame:
         logger.info(f"[ForecastAgent] Generating {hours}h forecast for {city}...")
-
+        logger.info(f"recent_df before predict: {len(recent_df)} rows")
+        logger.info(recent_df.tail())
         forecast = self.model.predict(recent_df, n_steps=hours * 4)
 
         BUS.set(f"forecast_{city}", forecast.to_dict(orient="records"))

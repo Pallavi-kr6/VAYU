@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import joblib
 from loguru import logger
 from tqdm import tqdm
@@ -26,9 +26,45 @@ from tqdm import tqdm
 from config.settings import FORECAST_CONFIG, MODELS_DIR
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 logger.info(f"Device: {DEVICE}")
+
+
+def _log_tensor_stage(stage: str, tensor: torch.Tensor, *, raise_on_bad: bool = False) -> None:
+    """Log tensor shape/statistics and optionally stop at the first NaN/Inf."""
+    if tensor is None:
+        logger.info(f"---------------------------------------\nStage: {stage}\nShape: None\nNaN count: 0\nInf count: 0\nMin: nan\nMax: nan\nMean: nan\n---------------------------------------")
+        return
+
+    arr = tensor.detach().float().cpu()
+    flat = arr.reshape(-1)
+    nan_count = torch.isnan(flat).sum().item()
+    inf_count = torch.isinf(flat).sum().item()
+
+    if flat.numel() == 0:
+        mn = mx = mean = float("nan")
+    else:
+        finite = flat[torch.isfinite(flat)]
+        mn = finite.min().item() if finite.numel() else float("nan")
+        mx = finite.max().item() if finite.numel() else float("nan")
+        mean = finite.mean().item() if finite.numel() else float("nan")
+
+    logger.info(
+        f"---------------------------------------\n"
+        f"Stage: {stage}\n"
+        f"Shape: {tuple(arr.shape)}\n"
+        f"NaN count: {nan_count}\n"
+        f"Inf count: {inf_count}\n"
+        f"Min: {mn:.6f}\n"
+        f"Max: {mx:.6f}\n"
+        f"Mean: {mean:.6f}\n"
+        f"---------------------------------------"
+    )
+
+    if raise_on_bad and (nan_count > 0 or inf_count > 0):
+        raise RuntimeError(f"NaN/Inf detected at stage: {stage}")
 
 
 # ════════════════════════════════════════════════════════
@@ -73,17 +109,23 @@ class AQISequenceDataset(Dataset):
 # 2. MODEL — BiLSTM + Temporal Attention + Decoder
 # ════════════════════════════════════════════════════════
 class TemporalAttention(nn.Module):
-    """Scaled dot-product attention over encoder hidden states."""
+    """Decoder cross-attention over encoder hidden states."""
     def __init__(self, hidden_size: int):
         super().__init__()
-        self.attn  = nn.Linear(hidden_size * 2, hidden_size)
-        self.v     = nn.Linear(hidden_size, 1, bias=False)
+        # Legacy module retained to preserve compatibility with older checkpoints.
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
+        self.query_proj = nn.Linear(hidden_size, hidden_size)
+        self.key_proj = nn.Linear(hidden_size * 2, hidden_size)
+        self.v = nn.Linear(hidden_size, 1, bias=False)
 
-    def forward(self, encoder_out: torch.Tensor) -> torch.Tensor:
+    def forward(self, encoder_out: torch.Tensor, decoder_hidden: torch.Tensor):
         # encoder_out: [batch, seq_len, hidden*2]
-        energy  = torch.tanh(self.attn(encoder_out))  # [B, T, H]
-        scores  = self.v(energy).squeeze(-1)           # [B, T]
-        weights = torch.softmax(scores, dim=-1)        # [B, T]
+        # decoder_hidden: [batch, hidden]
+        query = self.query_proj(decoder_hidden).unsqueeze(1)  # [B, 1, H]
+        keys = self.key_proj(encoder_out)  # [B, T, H]
+        energy = torch.tanh(query + keys)  # [B, T, H]
+        scores = self.v(energy).squeeze(-1)  # [B, T]
+        weights = torch.softmax(scores, dim=-1)  # [B, T]
         context = (weights.unsqueeze(-1) * encoder_out).sum(dim=1)  # [B, H*2]
         return context, weights
 
@@ -134,42 +176,68 @@ class VAYUForecastModel(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 teacher_forcing_ratio: float = 0.5,
-                target: torch.Tensor = None) -> torch.Tensor:
+                target: torch.Tensor = None,
+                debug: bool = False) -> torch.Tensor:
         """
         x:      [B, seq_len, features]
         target: [B, forecast_len]  (None at inference)
         """
         B = x.size(0)
+        teacher_forcing_ratio = float(max(0.0, min(1.0, teacher_forcing_ratio)))
 
         # ── Encoder
         enc_out, (h_n, c_n) = self.encoder(x)   # enc_out: [B, T, H*2]
-        context, attn_w     = self.attention(enc_out)
+        if debug:
+            _log_tensor_stage("Encoder outputs", enc_out, raise_on_bad=True)
+            _log_tensor_stage("Encoder hidden states", h_n, raise_on_bad=True)
+            _log_tensor_stage("Encoder cell states", c_n, raise_on_bad=True)
 
-        # ── Bridge: avg hidden states of BiLSTM for decoder init
-        h_dec = torch.tanh(self.bridge(
-            enc_out.mean(dim=1)
-        )).unsqueeze(0).repeat(self.decoder.num_layers, 1, 1)
+        # Bridge from the encoder's final forward/backward states.
+        h_n = h_n.view(self.encoder.num_layers, 2, B, self.hidden_size)
+        h_forward = h_n[-1, 0]
+        h_backward = h_n[-1, 1]
+        bridge_input = torch.cat([h_forward, h_backward], dim=-1)  # [B, H*2]
+        h_dec = torch.tanh(self.bridge(bridge_input)).unsqueeze(0).repeat(
+            self.decoder.num_layers, 1, 1
+        )
         c_dec = torch.zeros_like(h_dec)
+        if debug:
+            _log_tensor_stage("Bridge hidden", h_dec, raise_on_bad=True)
+            _log_tensor_stage("Bridge cell", c_dec, raise_on_bad=True)
 
         # ── Decoder (autoregressive)
         # seed with last observed PM2.5 (normalised, first feature idx 0)
-        dec_in = x[:, -1, 0:1].unsqueeze(1)   # [B, 1, 1]
+        dec_in = x[:, -1, 0:1].unsqueeze(1)  # [B, 1, 1]
         outputs = []
 
         for t in range(self.forecast_len):
             dec_out, (h_dec, c_dec) = self.decoder(dec_in, (h_dec, c_dec))
-            # [B, 1, H] + context [B, H*2]
+            if debug:
+                _log_tensor_stage(f"Decoder step {t} output", dec_out, raise_on_bad=True)
+            decoder_hidden = h_dec[-1]
+            context, weights = self.attention(enc_out, decoder_hidden)
+            if debug:
+                _log_tensor_stage(f"Attention context step {t}", context, raise_on_bad=True)
+                _log_tensor_stage(f"Attention weights step {t}", weights, raise_on_bad=True)
             combined = torch.cat([dec_out.squeeze(1), context], dim=-1)
-            pred     = self.fc(combined)         # [B, 1]
+            if debug:
+                _log_tensor_stage(f"Combined step {t}", combined, raise_on_bad=True)
+            pred = self.fc(combined)  # [B, 1]
+            if debug:
+                _log_tensor_stage(f"Output projection step {t}", pred, raise_on_bad=True)
             outputs.append(pred)
 
-            # Teacher forcing during training
-            if target is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                dec_in = target[:, t:t+1].unsqueeze(-1)
+            # Teacher forcing during training; inference uses the previous prediction.
+            if (
+                target is not None
+                and self.training
+                and torch.rand(1, device=x.device).item() < teacher_forcing_ratio
+            ):
+                dec_in = target[:, t:t + 1].unsqueeze(-1)
             else:
                 dec_in = pred.unsqueeze(1)
 
-        return torch.cat(outputs, dim=1)         # [B, forecast_len]
+        return torch.cat(outputs, dim=1)  # [B, forecast_len]
 
 
 # ════════════════════════════════════════════════════════
@@ -181,7 +249,7 @@ def train_one_epoch(model, loader, optimizer, criterion, tf_ratio, scaler=None, 
     for X, y in loader:
         X, y = X.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=use_amp):
+        with autocast(device_type=AMP_DEVICE, enabled=use_amp):
             pred = model(X, teacher_forcing_ratio=tf_ratio, target=y)
             loss = criterion(pred, y)
         if scaler is not None:
@@ -198,22 +266,35 @@ def train_one_epoch(model, loader, optimizer, criterion, tf_ratio, scaler=None, 
     return total_loss / len(loader)
 
 
+def _inverse_pm25(scaled_vals: np.ndarray, scaler, pm25_idx: int) -> np.ndarray:
+    """Inverse-transform PM2.5 values from the fitted scaler."""
+    scale = scaler.scale_[pm25_idx]
+    mean = scaler.mean_[pm25_idx]
+    return scaled_vals * scale + mean
+
+
 @torch.no_grad()
-def evaluate(model, loader, criterion, use_amp=False):
+def evaluate(model, loader, criterion, scaler=None, feature_names=None, use_amp=False):
     model.eval()
     total_loss, preds_all, targets_all = 0, [], []
     for X, y in loader:
         X, y = X.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-        with autocast(enabled=use_amp):
-            pred  = model(X, teacher_forcing_ratio=0.0)
+        with autocast(device_type=AMP_DEVICE, enabled=use_amp):
+            pred = model(X, teacher_forcing_ratio=0.0)
             total_loss += criterion(pred, y).item()
         preds_all.append(pred.float().cpu().numpy())
         targets_all.append(y.cpu().numpy())
 
-    preds   = np.concatenate(preds_all).flatten()
+    preds = np.concatenate(preds_all).flatten()
     targets = np.concatenate(targets_all).flatten()
-    rmse    = np.sqrt(np.mean((preds - targets) ** 2))
-    mae     = np.mean(np.abs(preds - targets))
+
+    if scaler is not None and feature_names is not None:
+        pm25_idx = feature_names.index("pm25") if "pm25" in feature_names else 0
+        preds = _inverse_pm25(preds, scaler, pm25_idx)
+        targets = _inverse_pm25(targets, scaler, pm25_idx)
+
+    rmse = np.sqrt(np.mean((preds - targets) ** 2))
+    mae = np.mean(np.abs(preds - targets))
     return total_loss / len(loader), rmse, mae
 
 
@@ -290,8 +371,9 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg["epochs"], eta_min=1e-5)
-    criterion = nn.HuberLoss(delta=15.0)   # robust to extreme pollution spikes
-    amp_scaler = GradScaler(enabled=use_amp)
+    criterion = nn.HuberLoss(delta=1.0)
+    amp_scaler = GradScaler(AMP_DEVICE, enabled=use_amp)
+    scaler = joblib.load(MODELS_DIR / "aqi_scaler.pkl")
 
     best_val_rmse = float("inf")
     patience_cnt  = 0
@@ -299,15 +381,15 @@ def main():
 
     logger.info("Starting training...")
     for epoch in range(1, cfg["epochs"] + 1):
-        # Linear teacher forcing decay: 0.9 → 0.1 over epochs
-        tf_ratio = max(0.1, 0.9 - 0.8 * (epoch / cfg["epochs"]))
+        tf_ratio = max(0.0, 0.95 - 0.95 * ((epoch - 1) / max(cfg["epochs"] - 1, 1)))
 
         train_loss = train_one_epoch(
             model, train_loader, optimizer, criterion, tf_ratio,
             scaler=amp_scaler, use_amp=use_amp,
         )
         val_loss, val_rmse, val_mae = evaluate(
-            model, val_loader, criterion, use_amp=use_amp,
+            model, val_loader, criterion,
+            scaler=scaler, feature_names=features, use_amp=use_amp,
         )
         scheduler.step()
 
@@ -374,7 +456,7 @@ class ForecastInference:
             dropout      = 0.0,             # no dropout at inference
             forecast_len = cfg["forecast_len"],
         ).to(DEVICE)
-        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.load_state_dict(checkpoint["model_state"], strict=False)
         self.model.eval()
         self.scaler = joblib.load(MODELS_DIR / "aqi_scaler.pkl")
         self.pm25_idx = self.features.index("pm25") if "pm25" in self.features else 0
@@ -395,13 +477,45 @@ class ForecastInference:
         from data.preprocess import engineer_features
         from data.aqi_utils import waqi_aqi_category, scale_aqi_from_pm25
 
+        recent_df = recent_df.copy()
+        
+        # Fill missing meteorological data with forward fill (smooth variations)
+        # Then interpolate remaining small gaps
+        met_cols = ["temp", "humidity", "wind_speed", "wind_dir", "pressure", "rainfall_mm", "pblh"]
+        poll_cols = ["pm25", "pm10", "no2", "so2", "co", "o3"]
+        
+        for col in met_cols:
+            if col in recent_df.columns:
+                recent_df[col] = recent_df[col].ffill().bfill().interpolate(method="linear", limit_direction="both")
+        
+        for col in poll_cols:
+            if col in recent_df.columns:
+                recent_df[col] = recent_df[col].ffill().bfill().interpolate(method="linear", limit_direction="both")
+        
+        # After filling, ensure we have pm25 (the critical feature)
+        if "pm25" not in recent_df.columns or recent_df["pm25"].isna().all():
+            raise ValueError("PM2.5 data is required for forecast but all values are NaN.")
+        
+        # Drop only rows where critical columns (pm25) are still NaN
+        recent_df = recent_df.dropna(subset=["pm25"]).copy()
+        if recent_df.empty:
+            raise ValueError("No rows with valid PM2.5 data available for forecast.")
+
         feat_df = engineer_features(recent_df)
         feat_cols = [f for f in self.features if f in feat_df.columns]
         seq_len = FORECAST_CONFIG["sequence_len"]
 
+        # If we don't have enough rows after cleaning, pad with repeated recent values
+        if len(feat_df) < seq_len:
+            logger.warning(f"Only {len(feat_df)} rows available, need {seq_len}. Padding with repeated recent values.")
+            # Repeat the most recent row to reach seq_len
+            last_row = feat_df.iloc[-1:].copy()
+            padding = pd.concat([last_row] * (seq_len - len(feat_df)), ignore_index=True)
+            feat_df = pd.concat([feat_df, padding], ignore_index=True)
+
         X_df = feat_df[feat_cols].tail(seq_len).copy()
         if len(X_df) < seq_len:
-            raise ValueError(f"Need at least {seq_len} engineered rows for forecast; got {len(X_raw)}")
+            raise ValueError(f"Failed to prepare enough rows for forecast; got {len(X_df)}/{seq_len}")
 
         current_pm25 = float(recent_df["pm25"].iloc[-1])
         current_pm10 = float(
@@ -415,17 +529,46 @@ class ForecastInference:
             live_aqi = us_aqi_from_pm25(current_pm25)
         pm10_ratio = current_pm10 / max(current_pm25, 1.0)
 
-        X_scaled = self.scaler.transform(X_df)
-        X_tensor = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        if not np.isfinite(X_df[feat_cols].to_numpy()).all():
+            bad_cols = X_df[feat_cols].columns[np.isnan(X_df[feat_cols].to_numpy()).any(axis=0)].tolist()
+            raise ValueError(f"NaN/Inf values detected in engineered features before scaling: {bad_cols}")
 
-        pred_raw = self.model(X_tensor, teacher_forcing_ratio=0.0)
+        X_scaled = self.scaler.transform(X_df)
+        _log_tensor_stage("Scaled features", torch.tensor(X_scaled, dtype=torch.float32), raise_on_bad=False)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        _log_tensor_stage("Model input tensor", X_tensor, raise_on_bad=False)
+
+        pred_raw = self.model(X_tensor, teacher_forcing_ratio=0.0, debug=True)
         pm25_scaled = pred_raw.squeeze().cpu().numpy()
+
+        logger.info("=" * 60)
+        logger.info("RAW MODEL OUTPUT DEBUG")
+        logger.info("=" * 60)
+        logger.info(f"pred_raw shape: {tuple(pred_raw.shape)}")
+        logger.info(f"pm25_scaled shape: {pm25_scaled.shape}")
+        logger.info(f"First 20 scaled predictions: {pm25_scaled[:20]}")
+        logger.info(f"Last 20 scaled predictions: {pm25_scaled[-20:]}")
+        logger.info(f"Min prediction: {np.min(pm25_scaled):.6f}")
+        logger.info(f"Max prediction: {np.max(pm25_scaled):.6f}")
+        logger.info(f"Mean prediction: {np.mean(pm25_scaled):.6f}")
+        logger.info(f"Std prediction: {np.std(pm25_scaled):.6f}")
+        logger.info(f"Unique values (4 dp): {len(np.unique(np.round(pm25_scaled, 4)))}")
+        logger.info(f"Contains NaN: {np.isnan(pm25_scaled).any()}")
+        logger.info(f"Contains Inf: {np.isinf(pm25_scaled).any()}")
+        logger.info(f"All predictions identical: {np.allclose(pm25_scaled, pm25_scaled[0])}")
+        if np.allclose(pm25_scaled, pm25_scaled[0]):
+            logger.warning("Decoder appears to have collapsed to a constant prediction.")
+        logger.info("=" * 60)
 
         logger.info(f"Raw forecast (scaled): {pm25_scaled[:10].round(3).tolist()}")
 
         # Clip to training distribution (±2.5σ in scaled space)
         pm25_scaled = np.clip(pm25_scaled, -2.5, 2.5)
         pm25_inv = self._inverse_pm25(pm25_scaled)
+        
+        if np.isnan(pm25_inv).any():
+            raise ValueError("Model produced NaN values after inverse scaling.")
+
         logger.info(f"Inverse forecast PM2.5 µg/m³: {pm25_inv[:10].round(1).tolist()}")
 
         # Ramp model trust over first 12h to anchor to current live reading
