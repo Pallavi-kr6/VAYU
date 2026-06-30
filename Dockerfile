@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y \
 
 # Python dependencies
 COPY requirements.txt .
+ENV PIP_PREFER_BINARY=1
+ENV CARGO_HOME=/tmp/cargo
+ENV RUSTUP_HOME=/tmp/rustup
+RUN mkdir -p /tmp/cargo /tmp/rustup
 RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 
