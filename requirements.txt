@@ -2,7 +2,7 @@
 numpy==1.26.4
 Cython==3.0.10
 pandas==2.2.3
-scikit-learn==1.4.2
+scikit-learn==1.5.2
 xgboost==2.0.3
 torch==2.3.0
 torchvision==0.18.0
