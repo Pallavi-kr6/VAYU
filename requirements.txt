@@ -1,6 +1,7 @@
 # ── Core ML / Data Science ──────────────────────────────
 numpy==1.26.4
-pandas==2.2.2
+Cython==3.0.10
+pandas==2.2.3
 scikit-learn==1.4.2
 xgboost==2.0.3
 torch==2.3.0
