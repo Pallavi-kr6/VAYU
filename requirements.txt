@@ -1,4 +1,5 @@
---prefer-binary
+ 
+--only-binary=:all:
 
 # ── Core ML / Data Science ──────────────────────────────
 numpy==1.26.4
@@ -21,7 +22,7 @@ supabase==2.10.0
 groq==0.9.0
 langchain==0.2.3
 langchain-community==0.2.4
-faiss-cpu==1.14.3
+faiss-cpu==1.8.0
 
 # ── Data fetching ────────────────────────────────────────
 requests==2.32.3

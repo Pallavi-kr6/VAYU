@@ -208,6 +208,20 @@ def fetch_comparative() -> dict:
     return r.json()
 
 
+@st.cache_data(ttl=300)
+def fetch_geospatial_insights(lat: float, lon: float) -> dict:
+    try:
+        r = requests.get(
+            f"{API_BASE}/geospatial-insights",
+            params={"lat": lat, "lon": lon},
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        return {"status": "error", "message": str(exc), "data": {}}
+
+
 with st.sidebar:
     st.markdown("## VAYU")
     st.markdown("Air Quality Intelligence Platform")
@@ -230,6 +244,9 @@ try:
 except Exception as e:
     st.error(f"Cannot reach VAYU API at {API_BASE}. Start with: `uvicorn api.main:app --port 8000`\n\n{e}")
     st.stop()
+
+lat, lon = CITY_COORDS[city][1], CITY_COORDS[city][0]
+geo = fetch_geospatial_insights(lat, lon)
 
 summary = dash.get("summary", {})
 attr = dash.get("attribution", {})
@@ -557,23 +574,68 @@ with right_col:
                     unsafe_allow_html=True,
                 )
 
-    st.markdown("")
-    with st.container():
-        st.markdown('<div class="glass-card"><div class="section-title">Health recommendations</div></div>', unsafe_allow_html=True)
-        for text, severity in recommendations:
-            badge_color = "#34d399" if severity == "Low" else "#f59e0b" if severity == "Moderate" else "#ef4444"
+    geo_info = geo.get("data", {})
+    geo_insights = geo_info.get("insights", {})
+    geo_status = geo.get("status", "error")
+    geo_error = geo.get("message", "")
+    vegetation_index = geo_insights.get("vegetation_index", 0.0)
+    fire_hotspots = geo_insights.get("fire_hotspots", [])
+    risk_factors = geo_insights.get("pollution_risk_factors", {})
+    risk_buckets = geo_insights.get("risk_buckets", {})
+
+    st.markdown(
+        '<div class="glass-card"><div class="section-title">Geospatial intelligence</div></div>',
+        unsafe_allow_html=True,
+    )
+    if geo_status == "ok" and geo_insights:
+        st.markdown(
+            f"""
+            <div class="glass-card" style="padding:0.9rem 1rem; margin-bottom:0.65rem;">
+              <div style="display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap;">
+                <div>
+                  <div class="subtle">Vegetation index</div>
+                  <div style="font-size:1.1rem; font-weight:700;">{vegetation_index:.3f}</div>
+                </div>
+                <div>
+                  <div class="subtle">Fire hotspots</div>
+                  <div style="font-size:1.1rem; font-weight:700;">{len(fire_hotspots)}</div>
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        bucket_html = "".join(
+            f'<div class="status-chip" style="margin-right:0.4rem; margin-bottom:0.4rem; border-color:rgba(255,255,255,0.1); background:rgba(255,255,255,0.05);">'
+            f'<span class="status-dot" style="background:{"#10B981" if color=="green" else "#FBBF24" if color=="yellow" else "#F97316" if color=="orange" else "#EF4444"};"></span>'
+            f'{key.title()}: {color}</div>'
+            for key, color in risk_buckets.items()
+        )
+        st.markdown(
+            f"""
+            <div class=\"glass-card\" style=\"padding:0.85rem 0.95rem; margin-bottom:0.65rem;\">
+              <div class=\"subtle\">Risk factors</div>
+              <div style=\"display:flex; flex-wrap:wrap; gap:0.4rem; margin-top:0.55rem;\">{bucket_html}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if fire_hotspots:
+            hotspot_summary = "".join(
+                f"<li>{h.get('timestamp')} @ {h.get('lat'):.3f},{h.get('lon'):.3f} ({h.get('confidence')})</li>"
+                for h in fire_hotspots[:3]
+            )
             st.markdown(
                 f"""
-                <div class="glass-card" style="margin-bottom:0.55rem; padding:0.75rem 0.8rem;">
-                  <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; margin-bottom:0.35rem;">
-                    <strong>{severity}</strong>
-                    <span style="padding:0.22rem 0.42rem; border-radius:999px; font-size:0.72rem; background:rgba(255,255,255,0.08); color:{badge_color};">{severity.upper()}</span>
-                  </div>
-                  <div class="subtle">{text}</div>
+                <div class="glass-card" style="padding:0.85rem 0.95rem;">
+                  <div class="subtle">Top fire hotspots</div>
+                  <ul style="margin:0.6rem 0 0 1rem;">{hotspot_summary}</ul>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+    else:
+        st.info("Geospatial intelligence is not available for this city or endpoint is disabled.")
 
 st.markdown("")
 st.markdown('<div class="glass-card"><div class="section-title">City network</div></div>', unsafe_allow_html=True)

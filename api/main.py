@@ -32,6 +32,7 @@ from agents.vayu_agents import (
     VAYUOrchestrator, BUS, CitizenHealthShieldAgent
 )
 from data.download_data import fetch_openweather_live
+from services.geospatial_service import GeoSpatialService
 
 # ─── App setup ────────────────────────────────────────────
 app = FastAPI(
@@ -302,6 +303,35 @@ async def get_comparative(refresh: bool = False):
         orchestrator.comparative_agent.run()
 
     return BUS.get("multi_city_report") or {"error": "No comparative data yet"}
+
+
+@app.get("/geospatial-insights")
+async def get_geospatial_insights(lat: float, lon: float):
+    """Optional geospatial intelligence layer for location-based risk insights."""
+    try:
+        service = GeoSpatialService()
+        insights = service.get_insights(lat, lon)
+        return {"status": "ok", "data": insights}
+    except Exception as exc:
+        logger.warning("Geospatial insights failed: %s", exc)
+        return {
+            "status": "fallback",
+            "data": {
+                "location": {"lat": lat, "lon": lon},
+                "insights": {
+                    "vegetation_index": 0.0,
+                    "fire_hotspots": [],
+                    "land_use": {"type": "FeatureCollection", "features": []},
+                    "pollution_risk_factors": {
+                        "vehicular": 0.0,
+                        "industrial": 0.0,
+                        "biomass": 0.0,
+                    },
+                },
+                "confidence_score": 0.0,
+            },
+            "message": str(exc),
+        }
 
 
 # ─── Chatbot ──────────────────────────────────────────────

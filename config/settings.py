@@ -8,13 +8,13 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
-
 # ── Project Paths ─────────────────────────────────────────
-BASE_DIR   = Path(__file__).parent.parent
+BASE_DIR   = Path(__file__).resolve().parent.parent
 DATA_DIR   = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models" / "saved"
 LOGS_DIR   = BASE_DIR / "logs"
+
+load_dotenv(BASE_DIR / ".env", override=False)
 
 for d in [DATA_DIR, MODELS_DIR, LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -28,6 +28,12 @@ TWILIO_SID         = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN       = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_NO = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 OPENWEATHER_KEY    = os.getenv("OPENWEATHER_API_KEY", "")
+
+# Optional fallback credentials for external geospatial providers.
+# Set these in your .env file if you want the app to try a backup key automatically.
+SENTINEL_CLIENT_ID_FALLBACK = os.getenv("SENTINEL_CLIENT_ID_FALLBACK", "")
+SENTINEL_CLIENT_SECRET_FALLBACK = os.getenv("SENTINEL_CLIENT_SECRET_FALLBACK", "")
+NASA_FIRMS_API_KEY_FALLBACK = os.getenv("NASA_FIRMS_API_KEY_FALLBACK", "")
 
 # ── Supabase (replaces local PostgreSQL / SQLite) ─────────
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
@@ -105,6 +111,16 @@ ATTRIBUTION_CONFIG = {
 
 # ── H3 Spatial Resolution ────────────────────────────────
 H3_RESOLUTION = 8    # ~460m hexagons ≈ ward level
+
+# ── Geospatial Intelligence Flags ─────────────────────────
+ENABLE_SENTINEL = os.getenv("ENABLE_SENTINEL", "true").lower() in ("1", "true", "yes")
+ENABLE_NASA_FIRMS = os.getenv("ENABLE_NASA_FIRMS", "true").lower() in ("1", "true", "yes")
+ENABLE_OSM = os.getenv("ENABLE_OSM", "true").lower() in ("1", "true", "yes")
+
+SENTINEL_CLIENT_ID = os.getenv("SENTINEL_CLIENT_ID", "")
+SENTINEL_CLIENT_SECRET = os.getenv("SENTINEL_CLIENT_SECRET", "")
+NASA_FIRMS_API_KEY = os.getenv("NASA_FIRMS_API_KEY", "")
+OSM_OVERPASS_URL = os.getenv("OSM_OVERPASS_URL", "https://overpass-api.de/api/interpreter")
 
 # ── Update Intervals ──────────────────────────────────────
 CAAQMS_INTERVAL_MIN   = 15
