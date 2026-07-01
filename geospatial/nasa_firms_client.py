@@ -120,13 +120,13 @@ class NASAFIRMSClient:
                     
                     response.raise_for_status()
                     hotspots = self._parse_csv_response(response.text, bbox)
-                    
-                    if hotspots:
+                    if hotspots is not None:
                         print(f"NASA FIRMS: Found {len(hotspots)} hotspots from {source}")
                         logger.info(f"NASA FIRMS: Successfully retrieved {len(hotspots)} hotspots from {source}")
                         return hotspots
                     else:
                         print(f"NASA FIRMS: No hotspots found in response from {source}")
+                        return []
                         
                 except Exception as exc:
                     print(f"NASA FIRMS: {source} failed - {exc}")

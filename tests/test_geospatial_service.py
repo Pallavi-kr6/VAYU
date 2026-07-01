@@ -14,6 +14,12 @@ class GeoSpatialServiceFallbackTests(unittest.TestCase):
 
         self.assertEqual(result["location"], {"lat": 22.5726, "lon": 88.3639})
         self.assertEqual(result["insights"]["fire_hotspots"], [])
+        self.assertEqual(result["insights"]["fire_hotspot_summary"], {
+            "status": "success",
+            "count": 0,
+            "hotspots": [],
+            "message": "No active fire hotspots detected in this area during the selected period.",
+        })
         self.assertEqual(result["insights"]["land_use"], {"type": "FeatureCollection", "features": []})
         self.assertEqual(result["insights"]["pollution_risk_factors"], {"vehicular": 0.0, "industrial": 0.0, "biomass": 0.0})
         self.assertEqual(result["confidence_score"], 0.0)

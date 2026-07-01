@@ -24,6 +24,12 @@ class GeoSpatialService:
     def get_insights(self, lat: float, lon: float) -> Dict[str, Any]:
         vegetation_index = 0.0
         fire_hotspots = []
+        fire_hotspot_summary = {
+            "status": "success",
+            "count": 0,
+            "hotspots": [],
+            "message": "No active fire hotspots detected in this area during the selected period.",
+        }
         land_use_geojson = {"type": "FeatureCollection", "features": []}
         pollution_risk_factors = {
             "vehicular": 0.0,
@@ -49,6 +55,16 @@ class GeoSpatialService:
                 fire_hotspots = self.nasa.fetch_hotspots(lat, lon)
                 biomass_score = self._compute_biomass_score(fire_hotspots)
                 pollution_risk_factors["biomass"] = biomass_score
+                fire_hotspot_summary = {
+                    "status": "success",
+                    "count": len(fire_hotspots),
+                    "hotspots": fire_hotspots,
+                    "message": (
+                        "No active fire hotspots detected in this area during the selected period."
+                        if not fire_hotspots
+                        else f"Detected {len(fire_hotspots)} active fire hotspot(s) in the selected area."
+                    ),
+                }
                 provider_successes["nasa"] = True
             except Exception as exc:
                 logger.info("NASA FIRMS unavailable: %s", exc)
@@ -71,6 +87,7 @@ class GeoSpatialService:
             "insights": {
                 "vegetation_index": vegetation_index,
                 "fire_hotspots": fire_hotspots,
+                "fire_hotspot_summary": fire_hotspot_summary,
                 "land_use": land_use_geojson,
                 "pollution_risk_factors": pollution_risk_factors,
                 "risk_buckets": risk_buckets,
